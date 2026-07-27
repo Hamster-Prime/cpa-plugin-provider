@@ -1,0 +1,261 @@
+name: Build
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PLUGIN_ID: multi-protocol-provider
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -race ./... ./.github/scripts
+      - run: go vet ./... ./.github/scripts
+      - name: Vulnerability scan
+        run: |
+          set -euo pipefail
+          GOTOOLCHAIN=go1.26.5 go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          "$(go env GOPATH)/bin/govulncheck" ./...
+
+  host-patch:
+    name: Test host patch against CPA v${{ matrix.cpa-version }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cpa-version: 7.2.102
+            cpa-ref: 8423cce2d1004e80948a9e2c60ee69354c0aabc3
+          - cpa-version: 7.2.103
+            cpa-ref: cade44b9cdee6b9328ea2648fd119129fdf11e2d
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: router-for-me/CLIProxyAPI
+          ref: ${{ matrix.cpa-ref }}
+          path: CLIProxyAPI
+          fetch-depth: 1
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.26.5
+          cache: true
+          cache-dependency-path: CLIProxyAPI/go.sum
+      - name: Apply host patch
+        working-directory: CLIProxyAPI
+        run: |
+          set -euo pipefail
+          git apply --check ../patches/CLIProxyAPI-v7.2.102-plugin-host-security.patch
+          git apply ../patches/CLIProxyAPI-v7.2.102-plugin-host-security.patch
+          git diff --check
+      - name: Test patched host
+        working-directory: CLIProxyAPI
+        run: |
+          set -euo pipefail
+          go test -count=1 ./internal/pluginhost ./internal/thinking ./sdk/cliproxy/auth
+          go test -race -count=1 ./internal/pluginhost ./internal/thinking ./sdk/cliproxy/auth
+      - name: Build patched host
+        working-directory: CLIProxyAPI
+        run: |
+          set -euo pipefail
+          go build -o "${RUNNER_TEMP}/cli-proxy-api" ./cmd/server
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
+            go test -c -o "${RUNNER_TEMP}/pluginhost.test.exe" ./internal/pluginhost
+
+  build-linux:
+    needs: [test, host-patch]
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    container: debian:bullseye-slim@sha256:cba95a21c96c1f5fc2470081829363eed57706634f7dc26e8c6712934303d57a
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-24.04
+            ext: so
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-24.04-arm
+            ext: so
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends binutils ca-certificates gcc git libc6-dev
+          rm -rf /var/lib/apt/lists/*
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Resolve names
+        run: |
+          set -euo pipefail
+          VERSION="0.0.0-dev"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          {
+            echo "VERSION=${VERSION}"
+            echo "LIBRARY=${PLUGIN_ID}.${{ matrix.ext }}"
+            echo "ARCHIVE=${PLUGIN_ID}_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.zip"
+          } >> "${GITHUB_ENV}"
+      - name: Build shared library
+        run: |
+          set -euo pipefail
+          if [[ "$(go env GOVERSION)" != "go1.26.5" ]]; then
+            echo "release must use Go 1.26.5" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          CGO_ENABLED=1 GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" \
+            go build -buildvcs=false -trimpath -buildmode=c-shared \
+              -ldflags "-s -w -X main.pluginVersion=${VERSION}" \
+              -o "dist/${LIBRARY}" "./cmd/${PLUGIN_ID}"
+          rm -f "dist/${PLUGIN_ID}.h"
+      - name: Scan binary vulnerabilities
+        run: |
+          set -euo pipefail
+          GOTOOLCHAIN=go1.26.5 go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          "$(go env GOPATH)/bin/govulncheck" -mode=binary "dist/${LIBRARY}"
+      - name: Verify GLIBC baseline
+        run: |
+          set -euo pipefail
+          highest="$(objdump -T "dist/${LIBRARY}" | sed -nE 's/.*GLIBC_([0-9]+\.[0-9]+).*/\1/p' | sort -V | tail -n 1)"
+          if [[ -z "${highest}" ]]; then
+            echo "no GLIBC symbol versions found" >&2
+            exit 1
+          fi
+          if [[ "$(printf '%s\n' "${highest}" "2.31" | sort -V | tail -n 1)" != "2.31" ]]; then
+            echo "highest GLIBC symbol version is ${highest}, expected <= 2.31" >&2
+            exit 1
+          fi
+      - name: Package
+        run: |
+          set -euo pipefail
+          go run ./.github/scripts/package-release.go \
+            -root . \
+            -library "dist/${LIBRARY}" \
+            -archive "${ARCHIVE}" \
+            -checksum "${ARCHIVE}.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+          if-no-files-found: error
+
+  build-native:
+    needs: [test, host-patch]
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: darwin
+            goarch: amd64
+            runner: macos-15-intel
+            ext: dylib
+          - goos: darwin
+            goarch: arm64
+            runner: macos-15
+            ext: dylib
+          - goos: windows
+            goarch: amd64
+            runner: windows-2025
+            ext: dll
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Resolve names
+        run: |
+          set -euo pipefail
+          VERSION="0.0.0-dev"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          {
+            echo "VERSION=${VERSION}"
+            echo "LIBRARY=${PLUGIN_ID}.${{ matrix.ext }}"
+            echo "ARCHIVE=${PLUGIN_ID}_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.zip"
+          } >> "${GITHUB_ENV}"
+      - name: Build shared library
+        run: |
+          set -euo pipefail
+          if [[ "$(go env GOVERSION)" != "go1.26.5" ]]; then
+            echo "release must use Go 1.26.5" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          CGO_ENABLED=1 GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" \
+            go build -buildvcs=false -trimpath -buildmode=c-shared \
+              -ldflags "-s -w -X main.pluginVersion=${VERSION}" \
+              -o "dist/${LIBRARY}" "./cmd/${PLUGIN_ID}"
+          rm -f "dist/${PLUGIN_ID}.h"
+      - name: Package
+        run: |
+          set -euo pipefail
+          go run ./.github/scripts/package-release.go \
+            -root . \
+            -library "dist/${LIBRARY}" \
+            -archive "${ARCHIVE}" \
+            -checksum "${ARCHIVE}.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [host-patch, build-linux, build-native]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sort dist/*.sha256 > dist/checksums.txt
+          gh release create "${GITHUB_REF_NAME}" dist/*.zip dist/checksums.txt \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes

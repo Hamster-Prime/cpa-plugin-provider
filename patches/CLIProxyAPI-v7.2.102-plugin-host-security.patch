@@ -1,0 +1,2960 @@
+diff --git a/internal/pluginhost/adapters.go b/internal/pluginhost/adapters.go
+index 542fc6b..259697c 100644
+--- a/internal/pluginhost/adapters.go
++++ b/internal/pluginhost/adapters.go
+@@ -366,13 +366,24 @@ func (h *Host) ModelsForAuth(ctx context.Context, auth *coreauth.Auth) AuthModel
+ 		}
+ 		var updated *coreauth.Auth
+ 		if authDataHasValue(resp.AuthUpdate) {
+-			updated = h.AuthDataToCoreAuth(authDataWithDefaults(resp.AuthUpdate, auth), path, auth.FileName)
++			update := authDataWithDefaults(resp.AuthUpdate, auth)
++			// A complete auth record returned from per-auth model discovery is
++			// authoritative for the model prefix. Treating an explicit empty
++			// prefix as missing would retain stale routing after reconfigure.
++			if authDataIsComplete(resp.AuthUpdate) {
++				update.Prefix = strings.TrimSpace(resp.AuthUpdate.Prefix)
++			}
++			updated = h.AuthDataToCoreAuth(update, path, auth.FileName)
+ 		}
+ 		return AuthModelResult{Provider: respProvider, Models: models, Auth: updated, Handled: true}
+ 	}
+ 	return AuthModelResult{}
+ }
+ 
++func authDataIsComplete(data pluginapi.AuthData) bool {
++	return strings.TrimSpace(data.Provider) != "" && strings.TrimSpace(data.ID) != "" && len(data.StorageJSON) > 0
++}
++
+ func authDataHasValue(data pluginapi.AuthData) bool {
+ 	return strings.TrimSpace(data.Provider) != "" ||
+ 		strings.TrimSpace(data.ID) != "" ||
+diff --git a/internal/pluginhost/adapters_executors.go b/internal/pluginhost/adapters_executors.go
+index 38e9e38..8320be2 100644
+--- a/internal/pluginhost/adapters_executors.go
++++ b/internal/pluginhost/adapters_executors.go
+@@ -11,10 +11,12 @@ import (
+ 	"strings"
+ 
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+ 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+ 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+ 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
++	"github.com/tidwall/gjson"
+ )
+ 
+ type executorManager interface {
+@@ -393,6 +395,22 @@ type preparedExecutorCall struct {
+ 	outputFormat    sdktranslator.Format
+ }
+ 
++func executorThinkingModel(fallback string, opts coreexecutor.Options) string {
++	if len(opts.Metadata) != 0 {
++		switch value := opts.Metadata[coreexecutor.RequestedModelMetadataKey].(type) {
++		case string:
++			if requested := strings.TrimSpace(value); requested != "" {
++				return requested
++			}
++		case []byte:
++			if requested := strings.TrimSpace(string(value)); requested != "" {
++				return requested
++			}
++		}
++	}
++	return fallback
++}
++
+ func (a *executorAdapter) prepareExecutorCall(req coreexecutor.Request, opts coreexecutor.Options) (preparedExecutorCall, error) {
+ 	inputRequested := executorInputFormat(req, opts)
+ 	requestedFormat := executorRequestedFormat(req, opts)
+@@ -410,6 +428,20 @@ func (a *executorAdapter) prepareExecutorCall(req coreexecutor.Request, opts cor
+ 	if inputRequested != "" && inputRequested != inputFormat {
+ 		nativeReq.Payload = sdktranslator.TranslateRequest(inputRequested, inputFormat, req.Model, req.Payload, opts.Stream)
+ 	}
++	if !strings.EqualFold(inputFormat.String(), "openai-image") {
++		var errThinking error
++		nativeReq.Payload, errThinking = thinking.ApplyThinkingWithApplier(
++			nativeReq.Payload,
++			executorThinkingModel(nativeReq.Model, nativeOpts),
++			inputRequested.String(),
++			inputFormat.String(),
++			a.provider,
++			a.provider,
++		)
++		if errThinking != nil {
++			return preparedExecutorCall{}, errThinking
++		}
++	}
+ 	nativeReq.Format = outputFormat
+ 	nativeOpts.SourceFormat = inputFormat
+ 	nativeOpts.ResponseFormat = outputFormat
+@@ -537,6 +569,79 @@ func (a *executorAdapter) translateExecutorResponse(ctx context.Context, prepare
+ 	return sdktranslator.TranslateNonStream(ctx, prepared.outputFormat, prepared.requestedFormat, prepared.req.Model, originalRequest, prepared.req.Payload, payload, param)
+ }
+ 
++func (a *executorAdapter) translateExecutorTokenCount(ctx context.Context, prepared preparedExecutorCall, payload []byte) ([]byte, error) {
++	if prepared.requestedFormat == "" || prepared.outputFormat == prepared.requestedFormat {
++		return bytes.Clone(payload), nil
++	}
++
++	if _, knownTarget := executorTokenCountPayload(prepared.requestedFormat, 0); !knownTarget {
++		return a.translateExecutorResponse(ctx, prepared, payload, false, nil), nil
++	}
++
++	nativeFormat := prepared.outputFormat
++	count, okCount := executorTokenCountValue(nativeFormat, payload)
++	if !okCount && prepared.inputFormat != nativeFormat {
++		if inputCount, okInputCount := executorTokenCountValue(prepared.inputFormat, payload); okInputCount {
++			count = inputCount
++			nativeFormat = prepared.inputFormat
++			okCount = true
++		}
++	}
++	if !okCount {
++		return nil, fmt.Errorf("plugin executor %s returned an invalid %s token count response", a.Identifier(), prepared.outputFormat)
++	}
++
++	fallback, _ := executorTokenCountPayload(prepared.requestedFormat, count)
++	return sdktranslator.TranslateTokenCount(ctx, nativeFormat, prepared.requestedFormat, count, fallback), nil
++}
++
++func executorTokenCountValue(format sdktranslator.Format, payload []byte) (int64, bool) {
++	if !gjson.ValidBytes(payload) {
++		return 0, false
++	}
++
++	var paths []string
++	switch normalizeExecutorFormatName(format.String()) {
++	case sdktranslator.FormatOpenAI:
++		paths = []string{"usage.prompt_tokens"}
++	case sdktranslator.FormatOpenAIResponse:
++		paths = []string{"usage.input_tokens", "response.usage.input_tokens"}
++	case sdktranslator.FormatClaude:
++		paths = []string{"input_tokens"}
++	case sdktranslator.FormatGemini:
++		paths = []string{"totalTokens", "usageMetadata.promptTokenCount"}
++	default:
++		return 0, false
++	}
++
++	for _, path := range paths {
++		value := gjson.GetBytes(payload, path)
++		if !value.Exists() || value.Type != gjson.Number {
++			continue
++		}
++		count := value.Int()
++		if count >= 0 {
++			return count, true
++		}
++	}
++	return 0, false
++}
++
++func executorTokenCountPayload(format sdktranslator.Format, count int64) ([]byte, bool) {
++	switch normalizeExecutorFormatName(format.String()) {
++	case sdktranslator.FormatOpenAI:
++		return []byte(fmt.Sprintf(`{"usage":{"prompt_tokens":%d,"completion_tokens":0,"total_tokens":%d}}`, count, count)), true
++	case sdktranslator.FormatOpenAIResponse:
++		return []byte(fmt.Sprintf(`{"usage":{"input_tokens":%d,"output_tokens":0,"total_tokens":%d}}`, count, count)), true
++	case sdktranslator.FormatClaude:
++		return []byte(fmt.Sprintf(`{"input_tokens":%d}`, count)), true
++	case sdktranslator.FormatGemini:
++		return []byte(fmt.Sprintf(`{"totalTokens":%d,"promptTokensDetails":[{"modality":"TEXT","tokenCount":%d}]}`, count, count)), true
++	default:
++		return nil, false
++	}
++}
++
+ func (a *executorAdapter) translateExecutorStreamChunks(ctx context.Context, prepared preparedExecutorCall, in <-chan pluginapi.ExecutorStreamChunk) <-chan pluginapi.ExecutorStreamChunk {
+ 	if prepared.requestedFormat == "" || prepared.outputFormat == prepared.requestedFormat {
+ 		return in
+@@ -778,8 +883,12 @@ func (a *executorAdapter) CountTokens(ctx context.Context, auth *coreauth.Auth,
+ 	if errCountTokens != nil {
+ 		return coreexecutor.Response{}, errCountTokens
+ 	}
++	payload, errTranslate := a.translateExecutorTokenCount(ctx, prepared, pluginResp.Payload)
++	if errTranslate != nil {
++		return coreexecutor.Response{}, errTranslate
++	}
+ 	return coreexecutor.Response{
+-		Payload:  a.translateExecutorResponse(ctx, prepared, pluginResp.Payload, false, nil),
++		Payload:  payload,
+ 		Metadata: cloneAnyMap(pluginResp.Metadata),
+ 		Headers:  cloneHeader(pluginResp.Headers),
+ 	}, nil
+diff --git a/internal/pluginhost/adapters_test.go b/internal/pluginhost/adapters_test.go
+index 9540040..0c6d69d 100644
+--- a/internal/pluginhost/adapters_test.go
++++ b/internal/pluginhost/adapters_test.go
+@@ -21,6 +21,7 @@ import (
+ 	coreusage "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+ 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
++	"github.com/tidwall/gjson"
+ )
+ 
+ func TestPluginModelInfoToRegistryModelInfoClonesThinkingAndSlices(t *testing.T) {
+@@ -698,6 +699,42 @@ func TestModelsForAuthOAuthScopeFallsBackToExecutorIdentifier(t *testing.T) {
+ 	}
+ }
+ 
++func TestModelsForAuthCompleteUpdateCanClearPrefix(t *testing.T) {
++	host := newHostWithRecords(capabilityRecord{
++		id: "alpha",
++		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
++			ModelProvider: modelProviderFunc{
++				modelsForAuth: func(context.Context, pluginapi.AuthModelRequest) (pluginapi.ModelResponse, error) {
++					return pluginapi.ModelResponse{
++						Provider: "plugin-provider",
++						Models:   []pluginapi.ModelInfo{{ID: "model"}},
++						AuthUpdate: pluginapi.AuthData{
++							Provider:    "plugin-provider",
++							ID:          "plugin-auth",
++							Prefix:      "",
++							StorageJSON: []byte(`{"type":"plugin-provider","api-key":"secret"}`),
++						},
++					}, nil
++				},
++			},
++			Executor:           &fakeExecutor{identifier: "plugin-provider"},
++			ExecutorModelScope: pluginapi.ExecutorModelScopeOAuth,
++		}},
++	})
++
++	result := host.ModelsForAuth(context.Background(), &coreauth.Auth{
++		ID:       "plugin-auth",
++		Provider: "plugin-provider",
++		Prefix:   "stale-prefix",
++	})
++	if !result.Handled || result.Auth == nil {
++		t.Fatalf("ModelsForAuth() = %#v, want auth update", result)
++	}
++	if result.Auth.Prefix != "" {
++		t.Fatalf("updated prefix = %q, want cleared", result.Auth.Prefix)
++	}
++}
++
+ func TestRegisterExecutorsStaticScopeSkipsModelsForAuth(t *testing.T) {
+ 	modelRegistry := newFakeModelRegistry()
+ 	manager := newFakeExecutorManager()
+@@ -2848,6 +2885,220 @@ func TestExecutorAdapterUsesResponseFormatForOutputTranslation(t *testing.T) {
+ 	}
+ }
+ 
++func TestExecutorAdapterTranslatesNativeTokenCountResponses(t *testing.T) {
++	tests := []struct {
++		name           string
++		upstreamFormat sdktranslator.Format
++		clientFormat   sdktranslator.Format
++		nativePayload  string
++		wantPayload    string
++	}{
++		{
++			name:           "openai upstream to claude",
++			upstreamFormat: sdktranslator.FormatOpenAI,
++			clientFormat:   sdktranslator.FormatClaude,
++			nativePayload:  `{"usage":{"prompt_tokens":11,"completion_tokens":0,"total_tokens":11}}`,
++			wantPayload:    `{"input_tokens":11}`,
++		},
++		{
++			name:           "gemini upstream to openai",
++			upstreamFormat: sdktranslator.FormatGemini,
++			clientFormat:   sdktranslator.FormatOpenAI,
++			nativePayload:  `{"totalTokens":12}`,
++			wantPayload:    `{"usage":{"prompt_tokens":12,"completion_tokens":0,"total_tokens":12}}`,
++		},
++		{
++			name:           "claude upstream to responses",
++			upstreamFormat: sdktranslator.FormatClaude,
++			clientFormat:   sdktranslator.FormatOpenAIResponse,
++			nativePayload:  `{"input_tokens":13}`,
++			wantPayload:    `{"usage":{"input_tokens":13,"output_tokens":0,"total_tokens":13}}`,
++		},
++		{
++			name:           "openai upstream to responses",
++			upstreamFormat: sdktranslator.FormatOpenAI,
++			clientFormat:   sdktranslator.FormatOpenAIResponse,
++			nativePayload:  `{"usage":{"prompt_tokens":15,"completion_tokens":0,"total_tokens":15}}`,
++			wantPayload:    `{"usage":{"input_tokens":15,"output_tokens":0,"total_tokens":15}}`,
++		},
++		{
++			name:           "openai upstream to gemini",
++			upstreamFormat: sdktranslator.FormatOpenAI,
++			clientFormat:   sdktranslator.FormatGemini,
++			nativePayload:  `{"usage":{"prompt_tokens":14,"completion_tokens":0,"total_tokens":14}}`,
++			wantPayload:    `{"totalTokens":14,"promptTokensDetails":[{"modality":"TEXT","tokenCount":14}]}`,
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			var captured pluginapi.ExecutorRequest
++			host := New()
++			adapter := newCurrentExecutorAdapterForTest(host, "token-count-executor", &fakeExecutor{
++				countTokens: func(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
++					captured = req
++					return pluginapi.ExecutorResponse{
++						Payload:  []byte(test.nativePayload),
++						Headers:  http.Header{"X-Token-Count": []string{"yes"}},
++						Metadata: map[string]any{"native": test.upstreamFormat.String()},
++					}, nil
++				},
++			},
++				[]sdktranslator.Format{test.upstreamFormat},
++				[]sdktranslator.Format{test.upstreamFormat},
++			)
++
++			resp, errCount := adapter.CountTokens(context.Background(), &coreauth.Auth{}, coreexecutor.Request{
++				Model:   "model-1",
++				Format:  test.clientFormat,
++				Payload: executorTokenCountTestRequest(test.clientFormat),
++			}, coreexecutor.Options{
++				SourceFormat:   test.clientFormat,
++				ResponseFormat: test.clientFormat,
++			})
++			if errCount != nil {
++				t.Fatalf("CountTokens() error = %v", errCount)
++			}
++			if captured.Format != test.upstreamFormat.String() || captured.SourceFormat != test.upstreamFormat.String() {
++				t.Fatalf("executor formats = %q / %q, want %q", captured.SourceFormat, captured.Format, test.upstreamFormat)
++			}
++			if got := string(resp.Payload); got != test.wantPayload {
++				t.Fatalf("CountTokens() payload = %s, want %s", got, test.wantPayload)
++			}
++			if resp.Headers.Get("X-Token-Count") != "yes" || resp.Metadata["native"] != test.upstreamFormat.String() {
++				t.Fatalf("CountTokens() response metadata = %#v / %#v, want plugin values", resp.Headers, resp.Metadata)
++			}
++		})
++	}
++}
++
++func TestExecutorTokenCountValueUsesNativeFormat(t *testing.T) {
++	tests := []struct {
++		format  sdktranslator.Format
++		payload string
++		want    int64
++	}{
++		{sdktranslator.FormatOpenAI, `{"usage":{"prompt_tokens":31}}`, 31},
++		{sdktranslator.FormatOpenAIResponse, `{"usage":{"input_tokens":32}}`, 32},
++		{sdktranslator.FormatClaude, `{"input_tokens":33}`, 33},
++		{sdktranslator.FormatGemini, `{"totalTokens":34}`, 34},
++	}
++
++	for _, test := range tests {
++		t.Run(test.format.String(), func(t *testing.T) {
++			got, ok := executorTokenCountValue(test.format, []byte(test.payload))
++			if !ok || got != test.want {
++				t.Fatalf("executorTokenCountValue() = %d, %t; want %d, true", got, ok, test.want)
++			}
++		})
++	}
++}
++
++func TestExecutorAdapterPreservesSameProtocolTokenCountPayload(t *testing.T) {
++	tests := []struct {
++		format  sdktranslator.Format
++		payload string
++	}{
++		{sdktranslator.FormatOpenAI, `{"usage":{"prompt_tokens":21,"completion_tokens":2,"total_tokens":23},"detail":"keep"}`},
++		{sdktranslator.FormatOpenAIResponse, `{"usage":{"input_tokens":22,"output_tokens":1,"total_tokens":23},"detail":"keep"}`},
++		{sdktranslator.FormatClaude, `{"input_tokens":23,"detail":"keep"}`},
++		{sdktranslator.FormatGemini, `{"totalTokens":24,"cachedContentTokenCount":2}`},
++	}
++
++	for _, test := range tests {
++		t.Run(test.format.String(), func(t *testing.T) {
++			host := New()
++			adapter := newCurrentExecutorAdapterForTest(host, "native-token-count-executor", &fakeExecutor{
++				countTokens: func(context.Context, pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
++					return pluginapi.ExecutorResponse{Payload: []byte(test.payload)}, nil
++				},
++			}, []sdktranslator.Format{test.format}, []sdktranslator.Format{test.format})
++
++			resp, errCount := adapter.CountTokens(context.Background(), &coreauth.Auth{}, coreexecutor.Request{
++				Model:   "model-1",
++				Format:  test.format,
++				Payload: executorTokenCountTestRequest(test.format),
++			}, coreexecutor.Options{SourceFormat: test.format, ResponseFormat: test.format})
++			if errCount != nil {
++				t.Fatalf("CountTokens() error = %v", errCount)
++			}
++			if got := string(resp.Payload); got != test.payload {
++				t.Fatalf("CountTokens() payload = %s, want native payload %s", got, test.payload)
++			}
++		})
++	}
++}
++
++func executorTokenCountTestRequest(format sdktranslator.Format) []byte {
++	switch format {
++	case sdktranslator.FormatOpenAIResponse:
++		return []byte(`{"model":"model-1","input":"hello"}`)
++	case sdktranslator.FormatGemini:
++		return []byte(`{"model":"model-1","contents":[{"role":"user","parts":[{"text":"hello"}]}]}`)
++	default:
++		return []byte(`{"model":"model-1","messages":[{"role":"user","content":"hello"}]}`)
++	}
++}
++
++func TestExecutorAdapterTranslatesLineFramedClaudeSSEToOpenAI(t *testing.T) {
++	streamChunks := make(chan pluginapi.ExecutorStreamChunk, 11)
++	for _, payload := range []string{
++		"event: message_start\n",
++		`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-test","content":[],"usage":{"input_tokens":3,"output_tokens":0}}}` + "\n",
++		"\n",
++		"event: content_block_delta\n",
++		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}` + "\n",
++		"\n",
++		"event: message_delta\n",
++		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}` + "\n",
++		"\n",
++		"event: message_stop\n",
++		`data: {"type":"message_stop"}` + "\n",
++	} {
++		streamChunks <- pluginapi.ExecutorStreamChunk{Payload: []byte(payload)}
++	}
++	close(streamChunks)
++
++	host := New()
++	adapter := newCurrentExecutorAdapterForTest(host, "line-framed-claude-executor", &fakeExecutor{
++		executeStream: func(context.Context, pluginapi.ExecutorRequest) (pluginapi.ExecutorStreamResponse, error) {
++			return pluginapi.ExecutorStreamResponse{Chunks: streamChunks}, nil
++		},
++	}, []sdktranslator.Format{sdktranslator.FormatClaude}, []sdktranslator.Format{sdktranslator.FormatClaude})
++
++	result, errStream := adapter.ExecuteStream(context.Background(), &coreauth.Auth{}, coreexecutor.Request{
++		Model:   "model-1",
++		Format:  sdktranslator.FormatOpenAI,
++		Payload: executorTokenCountTestRequest(sdktranslator.FormatOpenAI),
++	}, coreexecutor.Options{SourceFormat: sdktranslator.FormatOpenAI, ResponseFormat: sdktranslator.FormatOpenAI, Stream: true})
++	if errStream != nil {
++		t.Fatalf("ExecuteStream() error = %v", errStream)
++	}
++
++	var translated [][]byte
++	for chunk := range result.Chunks {
++		if chunk.Err != nil {
++			t.Fatalf("translated stream chunk error = %v", chunk.Err)
++		}
++		translated = append(translated, chunk.Payload)
++	}
++	if len(translated) != 3 {
++		t.Fatalf("translated stream emitted %d chunks, want message start, content, and message delta: %q", len(translated), translated)
++	}
++	joined := bytes.Join(translated, nil)
++	for _, want := range [][]byte{
++		[]byte(`"role":"assistant"`),
++		[]byte(`"content":"hello"`),
++		[]byte(`"finish_reason":"stop"`),
++		[]byte(`"prompt_tokens":3`),
++		[]byte(`"completion_tokens":1`),
++	} {
++		if !bytes.Contains(joined, want) {
++			t.Fatalf("translated stream = %s, want fragment %s", joined, want)
++		}
++	}
++}
++
+ func TestExecutorAdapterSelectsCustomOutputWithHostResponseTranslator(t *testing.T) {
+ 	customOutputFormat := sdktranslator.Format("plugin-custom-output")
+ 	requestedFormat := sdktranslator.FormatOpenAI
+@@ -3003,6 +3254,91 @@ func TestExecutorAdapterKeepsRawStreamFallbackWithOnlyHostResponseTranslator(t *
+ 	}
+ }
+ 
++func TestExecutorAdapterAppliesPluginThinkingBeforeExecution(t *testing.T) {
++	record := capabilityRecord{
++		id: "thinking-executor",
++		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
++			ThinkingApplier: testThinkingCapability{provider: "plugin-provider"},
++		}},
++	}
++	host := newHostWithRecords(record)
++	host.refreshThinkingProviders(host.activeRecords())
++	t.Cleanup(func() { host.refreshThinkingProviders(nil) })
++
++	var captured pluginapi.ExecutorRequest
++	adapter := newExecutorAdapterForRecordForTest(host, record, &fakeExecutor{
++		execute: func(_ context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
++			captured = req
++			return pluginapi.ExecutorResponse{Payload: req.Payload}, nil
++		},
++	}, []sdktranslator.Format{sdktranslator.FormatOpenAI}, []sdktranslator.Format{sdktranslator.FormatOpenAI})
++
++	_, err := adapter.Execute(context.Background(), &coreauth.Auth{}, coreexecutor.Request{
++		Model:   "plugin-model(8192)",
++		Format:  sdktranslator.FormatOpenAI,
++		Payload: []byte(`{"model":"plugin-model","messages":[]}`),
++	}, coreexecutor.Options{SourceFormat: sdktranslator.FormatOpenAI})
++	if err != nil {
++		t.Fatalf("Execute() error = %v", err)
++	}
++	if got := gjson.GetBytes(captured.Payload, "thinking_budget").Int(); got != 8192 {
++		t.Fatalf("thinking_budget = %d, want 8192; payload=%s", got, captured.Payload)
++	}
++	if got := gjson.GetBytes(captured.Payload, "plugin").String(); got != "plugin-provider" {
++		t.Fatalf("plugin = %q, want plugin-provider; payload=%s", got, captured.Payload)
++	}
++}
++
++func TestExecutorAdapterUsesRequestedModelForThinkingCapabilities(t *testing.T) {
++	const clientID = "plugin-thinking-prefixed-model-test"
++	modelRegistry := registry.GetGlobalRegistry()
++	modelRegistry.RegisterClient(clientID, "plugin-provider", []*registry.ModelInfo{{
++		ID:          "team/plugin-model",
++		Type:        "multi-protocol-provider",
++		UserDefined: false,
++		Thinking: &registry.ThinkingSupport{
++			Min: 1024,
++			Max: 4096,
++		},
++	}})
++	t.Cleanup(func() { modelRegistry.UnregisterClient(clientID) })
++
++	record := capabilityRecord{
++		id: "thinking-executor-prefixed",
++		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
++			ThinkingApplier: testThinkingCapability{provider: "plugin-provider"},
++		}},
++	}
++	host := newHostWithRecords(record)
++	host.refreshThinkingProviders(host.activeRecords())
++	t.Cleanup(func() { host.refreshThinkingProviders(nil) })
++
++	var captured pluginapi.ExecutorRequest
++	adapter := newExecutorAdapterForRecordForTest(host, record, &fakeExecutor{
++		execute: func(_ context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
++			captured = req
++			return pluginapi.ExecutorResponse{Payload: req.Payload}, nil
++		},
++	}, []sdktranslator.Format{sdktranslator.FormatOpenAI}, []sdktranslator.Format{sdktranslator.FormatOpenAI})
++
++	_, err := adapter.Execute(context.Background(), &coreauth.Auth{}, coreexecutor.Request{
++		Model:   "plugin-model(99999)",
++		Format:  sdktranslator.FormatOpenAI,
++		Payload: []byte(`{"model":"plugin-model","messages":[]}`),
++	}, coreexecutor.Options{
++		SourceFormat: sdktranslator.FormatOpenAI,
++		Metadata: map[string]any{
++			coreexecutor.RequestedModelMetadataKey: "team/plugin-model(99999)",
++		},
++	})
++	if err != nil {
++		t.Fatalf("Execute() error = %v", err)
++	}
++	if got := gjson.GetBytes(captured.Payload, "thinking_budget").Int(); got != 4096 {
++		t.Fatalf("thinking_budget = %d, want configured maximum 4096; payload=%s", got, captured.Payload)
++	}
++}
++
+ func TestExecutorAdapterPanicFusesAndReturnsError(t *testing.T) {
+ 	host := New()
+ 	calls := 0
+diff --git a/internal/pluginhost/auth_callbacks.go b/internal/pluginhost/auth_callbacks.go
+index 3573999..c064b7c 100644
+--- a/internal/pluginhost/auth_callbacks.go
++++ b/internal/pluginhost/auth_callbacks.go
+@@ -289,19 +289,118 @@ func (h *Host) saveAuthFile(ctx context.Context, name string, data []byte) (stri
+ 			dst = abs
+ 		}
+ 	}
+-	auth, errBuild := h.buildAuthFromFileData(dst, data)
++	fallback, errBuild := h.buildAuthFromFileData(dst, data)
+ 	if errBuild != nil {
+ 		return "", errBuild
+ 	}
+-	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
++	auths := []*coreauth.Auth{fallback}
++	parsed, handled, errParse := h.ParseAuths(ctx, pluginapi.AuthParseRequest{
++		Provider: fallback.Provider,
++		Path:     dst,
++		FileName: filepath.Base(dst),
++		RawJSON:  data,
++	})
++	if errParse != nil {
++		return "", fmt.Errorf("parse plugin auth file: %w", errParse)
++	}
++	if handled {
++		auths = parsed
++	}
++	auths, errPrepare := prepareSavedAuths(auths, handled, dst)
++	if errPrepare != nil {
++		return "", errPrepare
++	}
++	if errWrite := atomicWriteFile(dst, data); errWrite != nil {
+ 		return "", fmt.Errorf("failed to write auth file: %w", errWrite)
+ 	}
+-	if errUpsert := h.upsertAuthRecord(ctx, auth); errUpsert != nil {
+-		return "", errUpsert
++	if errReconcile := h.reconcileSavedAuths(coreauth.WithSkipPersist(ctx), dst, auths); errReconcile != nil {
++		return "", errReconcile
+ 	}
+ 	return dst, nil
+ }
+ 
++func prepareSavedAuths(auths []*coreauth.Auth, pluginHandled bool, path string) ([]*coreauth.Auth, error) {
++	compact := make([]*coreauth.Auth, 0, len(auths))
++	for _, auth := range auths {
++		if auth != nil {
++			compact = append(compact, auth)
++		}
++	}
++	seen := make(map[string]struct{}, len(compact))
++	for index, auth := range compact {
++		auth.ID = strings.TrimSpace(auth.ID)
++		if auth.ID == "" {
++			return nil, fmt.Errorf("parsed auth at index %d has no id", index)
++		}
++		if _, exists := seen[auth.ID]; exists {
++			return nil, fmt.Errorf("parsed auth has duplicate id %q", auth.ID)
++		}
++		seen[auth.ID] = struct{}{}
++		if auth.Attributes == nil {
++			auth.Attributes = make(map[string]string)
++		}
++		auth.Attributes[coreauth.AttributePath] = path
++		auth.Attributes[coreauth.AttributeSource] = path
++		auth.Attributes[coreauth.AttributeSourceBackend] = coreauth.AuthSourceFile
++		if pluginHandled && len(compact) > 1 {
++			coreauth.MarkPluginVirtualAuth(auth, path, index)
++		}
++		coreauth.ApplyCustomHeadersFromMetadata(auth)
++	}
++	return compact, nil
++}
++
++func (h *Host) reconcileSavedAuths(ctx context.Context, path string, auths []*coreauth.Auth) error {
++	manager := h.currentAuthManager()
++	if manager == nil {
++		return nil
++	}
++	desired := make(map[string]struct{}, len(auths))
++	for _, auth := range auths {
++		desired[auth.ID] = struct{}{}
++		if errUpsert := h.upsertAuthRecord(ctx, auth); errUpsert != nil {
++			return errUpsert
++		}
++	}
++	for _, existing := range manager.List() {
++		if existing == nil || !authUsesPhysicalPath(existing, path) {
++			continue
++		}
++		if _, keep := desired[existing.ID]; !keep {
++			manager.Remove(ctx, existing.ID)
++		}
++	}
++	return nil
++}
++
++func authUsesPhysicalPath(auth *coreauth.Auth, path string) bool {
++	if auth == nil || strings.TrimSpace(path) == "" {
++		return false
++	}
++	for _, candidate := range []string{
++		authAttribute(auth, coreauth.AttributePath),
++		authAttribute(auth, coreauth.AttributeVirtualSource),
++		authAttribute(auth, coreauth.AttributeSource),
++	} {
++		if samePhysicalPath(candidate, path) {
++			return true
++		}
++	}
++	return false
++}
++
++func samePhysicalPath(left, right string) bool {
++	left = filepath.Clean(strings.TrimSpace(left))
++	right = filepath.Clean(strings.TrimSpace(right))
++	if left == "." || right == "." {
++		return false
++	}
++	if runtime.GOOS == "windows" {
++		return strings.EqualFold(left, right)
++	}
++	return left == right
++}
++
+ func (h *Host) buildAuthFromFileData(path string, data []byte) (*coreauth.Auth, error) {
+ 	if strings.TrimSpace(path) == "" {
+ 		return nil, fmt.Errorf("auth path is empty")
+@@ -362,6 +461,9 @@ func (h *Host) upsertAuthRecord(ctx context.Context, auth *coreauth.Auth) error
+ 	}
+ 	if existing, ok := manager.GetByID(auth.ID); ok {
+ 		auth.CreatedAt = existing.CreatedAt
++		auth.LastRefreshedAt = existing.LastRefreshedAt
++		auth.NextRetryAfter = existing.NextRetryAfter
++		auth.Runtime = existing.Runtime
+ 		_, errUpdate := manager.Update(ctx, auth)
+ 		return errUpdate
+ 	}
+diff --git a/internal/pluginhost/auth_callbacks_test.go b/internal/pluginhost/auth_callbacks_test.go
+index 2a1b325..2fa1afd 100644
+--- a/internal/pluginhost/auth_callbacks_test.go
++++ b/internal/pluginhost/auth_callbacks_test.go
+@@ -213,6 +213,13 @@ func TestHostAuthGetRuntimeCallbackReturnsRuntimeInfo(t *testing.T) {
+ 
+ func TestHostAuthSaveCallbackWritesPhysicalFile(t *testing.T) {
+ 	authDir := t.TempDir()
++	path := filepath.Join(authDir, "saved.json")
++	if errWrite := os.WriteFile(path, []byte(`{"type":"old"}`), 0o644); errWrite != nil {
++		t.Fatalf("write pre-existing auth file: %v", errWrite)
++	}
++	if errChmod := os.Chmod(path, 0o644); errChmod != nil {
++		t.Fatalf("chmod pre-existing auth file: %v", errChmod)
++	}
+ 	host := New()
+ 	host.runtimeConfig = &config.Config{AuthDir: authDir}
+ 	host.SetAuthManager(coreauth.NewManager(nil, nil, nil))
+@@ -242,8 +249,112 @@ func TestHostAuthSaveCallbackWritesPhysicalFile(t *testing.T) {
+ 	if string(data) != `{"type":"demo","email":"saved@example.com","api_key":"saved-key"}` {
+ 		t.Fatalf("saved file = %q, want credential json", string(data))
+ 	}
++	info, errStat := os.Stat(resp.Path)
++	if errStat != nil {
++		t.Fatalf("stat saved file: %v", errStat)
++	}
++	if gotMode := info.Mode().Perm(); gotMode != 0o600 {
++		t.Fatalf("saved file mode = %o, want 600", gotMode)
++	}
+ 	auths := host.currentAuthManager().List()
+ 	if len(auths) != 1 || auths[0].FileName != "saved.json" {
+ 		t.Fatalf("auths = %#v, want one registered auth", auths)
+ 	}
+ }
++
++func TestHostAuthSaveCallbackReconcilesPluginMultiAuths(t *testing.T) {
++	authDir := t.TempDir()
++	path := filepath.Join(authDir, "saved.json")
++	raw := []byte(`{"type":"multi-auth","keys":[{"id":"primary"},{"id":"secondary"}]}`)
++	host := newHostWithRecords(capabilityRecord{
++		id: "multi-auth-plugin",
++		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
++			AuthProvider: fakeAuthProvider{
++				identifier: "multi-auth",
++				parseAuth: func(_ context.Context, req pluginapi.AuthParseRequest) (pluginapi.AuthParseResponse, error) {
++					if req.Provider != "multi-auth" || req.Path != path || req.FileName != "saved.json" {
++						t.Fatalf("ParseAuth request = %#v", req)
++					}
++					var payload struct {
++						Keys []struct {
++							ID string `json:"id"`
++						} `json:"keys"`
++					}
++					if errUnmarshal := json.Unmarshal(req.RawJSON, &payload); errUnmarshal != nil {
++						return pluginapi.AuthParseResponse{Handled: true}, errUnmarshal
++					}
++					auths := make([]pluginapi.AuthData, 0, len(payload.Keys))
++					for _, key := range payload.Keys {
++						auths = append(auths, pluginapi.AuthData{
++							Provider: "multi-auth", ID: "saved.json#" + key.ID, FileName: "saved.json",
++							StorageJSON: []byte(fmt.Sprintf(`{"type":"multi-auth","id":%q}`, key.ID)),
++						})
++					}
++					return pluginapi.AuthParseResponse{Handled: true, Auths: auths}, nil
++				},
++			},
++		}},
++	})
++	host.runtimeConfig = &config.Config{AuthDir: authDir}
++	host.SetAuthManager(coreauth.NewManager(nil, nil, nil))
++	for _, staleID := range []string{"saved.json", "saved.json#removed"} {
++		stale := &coreauth.Auth{
++			ID: staleID, Provider: "multi-auth", FileName: "saved.json", Status: coreauth.StatusActive,
++			Attributes: map[string]string{coreauth.AttributePath: path, coreauth.AttributeSource: path},
++		}
++		if _, errRegister := host.currentAuthManager().Register(coreauth.WithSkipPersist(context.Background()), stale); errRegister != nil {
++			t.Fatalf("register stale auth %q: %v", staleID, errRegister)
++		}
++	}
++
++	save := func(payload []byte) {
++		t.Helper()
++		req, errMarshal := json.Marshal(pluginapi.HostAuthSaveRequest{Name: "saved.json", JSON: payload})
++		if errMarshal != nil {
++			t.Fatalf("marshal request: %v", errMarshal)
++		}
++		if _, errCall := host.callFromPlugin(context.Background(), pluginabi.MethodHostAuthSave, req); errCall != nil {
++			t.Fatalf("callFromPlugin() error = %v", errCall)
++		}
++	}
++	save(raw)
++	auths := host.currentAuthManager().List()
++	if len(auths) != 2 {
++		t.Fatalf("auths = %#v, want two reconciled plugin auths", auths)
++	}
++	wantIDs := map[string]bool{"saved.json#primary": true, "saved.json#secondary": true}
++	for _, auth := range auths {
++		if !wantIDs[auth.ID] {
++			t.Fatalf("unexpected auth after reconcile: %#v", auth)
++		}
++		if !coreauth.IsPluginVirtualAuth(auth) || auth.Attributes[coreauth.AttributeVirtualSource] != path {
++			t.Fatalf("auth %q is not tied to physical plugin file: %#v", auth.ID, auth.Attributes)
++		}
++	}
++	indexes := make(map[string]string, len(auths))
++	for _, auth := range auths {
++		indexes[auth.ID] = auth.EnsureIndex()
++	}
++
++	reordered := []byte(`{"type":"multi-auth","keys":[{"id":"secondary"},{"id":"primary"}]}`)
++	save(reordered)
++	for _, auth := range host.currentAuthManager().List() {
++		if got := auth.EnsureIndex(); got != indexes[auth.ID] {
++			t.Fatalf("auth %q index changed after reorder: %q != %q", auth.ID, got, indexes[auth.ID])
++		}
++	}
++
++	removedFirst := []byte(`{"type":"multi-auth","keys":[{"id":"secondary"}]}`)
++	save(removedFirst)
++	auths = host.currentAuthManager().List()
++	if len(auths) != 1 || auths[0].ID != "saved.json#secondary" || auths[0].EnsureIndex() != indexes[auths[0].ID] {
++		t.Fatalf("auths after deleting first key = %#v, want stable secondary", auths)
++	}
++	saved, errRead := os.ReadFile(path)
++	if errRead != nil {
++		t.Fatalf("read saved file: %v", errRead)
++	}
++	if string(saved) != string(removedFirst) {
++		t.Fatalf("saved file = %q, want %q", saved, removedFirst)
++	}
++}
+diff --git a/internal/pluginhost/auth_provider.go b/internal/pluginhost/auth_provider.go
+index 68752b4..62ad3db 100644
+--- a/internal/pluginhost/auth_provider.go
++++ b/internal/pluginhost/auth_provider.go
+@@ -519,12 +519,20 @@ func atomicWriteFile(path string, data []byte) error {
+ 	defer func() {
+ 		_ = os.Remove(tmpPath)
+ 	}()
++	if errChmod := tmp.Chmod(0o600); errChmod != nil {
++		_ = tmp.Close()
++		return fmt.Errorf("secure temp auth file: %w", errChmod)
++	}
+ 	if _, errWrite := tmp.Write(data); errWrite != nil {
+ 		if errClose := tmp.Close(); errClose != nil {
+ 			errWrite = fmt.Errorf("%w; close temp auth file: %v", errWrite, errClose)
+ 		}
+ 		return fmt.Errorf("write temp auth file: %w", errWrite)
+ 	}
++	if errSync := tmp.Sync(); errSync != nil {
++		_ = tmp.Close()
++		return fmt.Errorf("sync temp auth file: %w", errSync)
++	}
+ 	if errClose := tmp.Close(); errClose != nil {
+ 		return fmt.Errorf("close temp auth file: %w", errClose)
+ 	}
+diff --git a/internal/pluginhost/callback_contexts.go b/internal/pluginhost/callback_contexts.go
+index 27c5aad..dd6b6ce 100644
+--- a/internal/pluginhost/callback_contexts.go
++++ b/internal/pluginhost/callback_contexts.go
+@@ -2,10 +2,13 @@ package pluginhost
+ 
+ import (
+ 	"context"
++	"fmt"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
++
++	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+ )
+ 
+ type callbackContextRegistry struct {
+@@ -15,16 +18,17 @@ type callbackContextRegistry struct {
+ }
+ 
+ type callbackContextEntry struct {
+-	ctx      context.Context
+-	pluginID string
+-	cleanup  []func()
++	ctx        context.Context
++	pluginID   string
++	httpClient pluginapi.HostHTTPClient
++	cleanup    []func()
+ }
+ 
+ func newCallbackContextRegistry() *callbackContextRegistry {
+ 	return &callbackContextRegistry{contexts: make(map[string]callbackContextEntry)}
+ }
+ 
+-func (r *callbackContextRegistry) open(ctx context.Context, pluginID string) (string, func()) {
++func (r *callbackContextRegistry) open(ctx context.Context, pluginID string, httpClient pluginapi.HostHTTPClient) (string, func()) {
+ 	if r == nil {
+ 		return "", func() {}
+ 	}
+@@ -33,9 +37,10 @@ func (r *callbackContextRegistry) open(ctx context.Context, pluginID string) (st
+ 	}
+ 	pluginID = strings.TrimSpace(pluginID)
+ 	ctx = withHostCallbackPluginID(ctx, pluginID)
++	ctx, cancel := context.WithCancel(ctx)
+ 	id := strconv.FormatUint(r.next.Add(1), 10)
+ 	r.mu.Lock()
+-	r.contexts[id] = callbackContextEntry{ctx: ctx, pluginID: pluginID}
++	r.contexts[id] = callbackContextEntry{ctx: ctx, pluginID: pluginID, httpClient: httpClient}
+ 	r.mu.Unlock()
+ 
+ 	var once sync.Once
+@@ -46,6 +51,7 @@ func (r *callbackContextRegistry) open(ctx context.Context, pluginID string) (st
+ 			entry := r.contexts[id]
+ 			delete(r.contexts, id)
+ 			r.mu.Unlock()
++			cancel()
+ 			cleanup = entry.cleanup
+ 			for _, fn := range cleanup {
+ 				if fn != nil {
+@@ -56,6 +62,19 @@ func (r *callbackContextRegistry) open(ctx context.Context, pluginID string) (st
+ 	}
+ }
+ 
++func (r *callbackContextRegistry) resolveHTTP(id string) (context.Context, string, pluginapi.HostHTTPClient, bool) {
++	if r == nil || id == "" {
++		return nil, "", nil, false
++	}
++	r.mu.RLock()
++	entry, ok := r.contexts[id]
++	r.mu.RUnlock()
++	if !ok || entry.ctx == nil {
++		return nil, "", nil, false
++	}
++	return entry.ctx, strings.TrimSpace(entry.pluginID), entry.httpClient, true
++}
++
+ func (r *callbackContextRegistry) pluginID(id string) string {
+ 	if r == nil || id == "" {
+ 		return ""
+@@ -105,10 +124,14 @@ func (h *Host) openCallbackContext(ctx context.Context) (string, func()) {
+ }
+ 
+ func (h *Host) openCallbackContextForPlugin(ctx context.Context, pluginID string) (string, func()) {
++	return h.openCallbackContextForPluginWithHTTPClient(ctx, pluginID, nil)
++}
++
++func (h *Host) openCallbackContextForPluginWithHTTPClient(ctx context.Context, pluginID string, httpClient pluginapi.HostHTTPClient) (string, func()) {
+ 	if h == nil || h.callbackContexts == nil {
+ 		return "", func() {}
+ 	}
+-	return h.callbackContexts.open(ctx, pluginID)
++	return h.callbackContexts.open(ctx, pluginID, httpClient)
+ }
+ 
+ func (h *Host) addCallbackCleanup(id string, cleanup func()) bool {
+@@ -137,3 +160,27 @@ func (h *Host) callbackContextPluginID(id string) string {
+ 	}
+ 	return h.callbackContexts.pluginID(id)
+ }
++
++func (h *Host) resolveCallbackHTTP(ctx context.Context, id string) (context.Context, pluginapi.HostHTTPClient, error) {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	if id == "" {
++		return ctx, h.newHTTPClient(nil), nil
++	}
++	if h == nil || h.callbackContexts == nil {
++		return nil, nil, fmt.Errorf("host callback context %s is unavailable", id)
++	}
++	callbackCtx, ownerPluginID, client, ok := h.callbackContexts.resolveHTTP(id)
++	if !ok {
++		return nil, nil, fmt.Errorf("host callback context %s is unavailable", id)
++	}
++	callerPluginID := hostCallbackPluginIDFromContext(ctx)
++	if callerPluginID != ownerPluginID {
++		return nil, nil, fmt.Errorf("host callback context %s belongs to another plugin", id)
++	}
++	if client == nil {
++		client = h.newHTTPClient(nil)
++	}
++	return callbackCtx, client, nil
++}
+diff --git a/internal/pluginhost/client_guard.go b/internal/pluginhost/client_guard.go
+index 9ddde8e..faefa66 100644
+--- a/internal/pluginhost/client_guard.go
++++ b/internal/pluginhost/client_guard.go
+@@ -70,6 +70,31 @@ func (c *guardedPluginClient) acquire() (pluginClient, error) {
+ 	return c.inner, nil
+ }
+ 
++func (c *guardedPluginClient) acquireLease() (func(), error) {
++	if c == nil {
++		return nil, fmt.Errorf("plugin client is closed")
++	}
++	c.mu.Lock()
++	if c.closed || c.inner == nil {
++		c.mu.Unlock()
++		return nil, fmt.Errorf("plugin client is closed")
++	}
++	c.calls++
++	c.mu.Unlock()
++
++	var once sync.Once
++	return func() {
++		once.Do(c.release)
++	}, nil
++}
++
++func acquirePluginClientLease(client pluginClient) (func(), error) {
++	if guarded, ok := client.(*guardedPluginClient); ok {
++		return guarded.acquireLease()
++	}
++	return func() {}, nil
++}
++
+ func (c *guardedPluginClient) release() {
+ 	c.mu.Lock()
+ 	c.calls--
+diff --git a/internal/pluginhost/client_guard_test.go b/internal/pluginhost/client_guard_test.go
+index 3fa2d01..81399db 100644
+--- a/internal/pluginhost/client_guard_test.go
++++ b/internal/pluginhost/client_guard_test.go
+@@ -13,6 +13,18 @@ type blockingGuardPluginClient struct {
+ 	shutdown atomic.Int32
+ }
+ 
++type idleGuardPluginClient struct {
++	shutdown atomic.Int32
++}
++
++func (c *idleGuardPluginClient) Call(context.Context, string, []byte) ([]byte, error) {
++	return nil, nil
++}
++
++func (c *idleGuardPluginClient) Shutdown() {
++	c.shutdown.Add(1)
++}
++
+ func (c *blockingGuardPluginClient) Call(context.Context, string, []byte) ([]byte, error) {
+ 	close(c.started)
+ 	<-c.release
+@@ -68,3 +80,40 @@ func TestGuardedPluginClientShutdownContextDetachesBlockedCall(t *testing.T) {
+ 		t.Fatalf("shutdown calls after active call exits = %d, want 1", got)
+ 	}
+ }
++
++func TestGuardedPluginClientLeaseDelaysShutdown(t *testing.T) {
++	inner := &idleGuardPluginClient{}
++	guarded := newGuardedPluginClient(inner)
++	releaseLease, errLease := guarded.acquireLease()
++	if errLease != nil {
++		t.Fatalf("acquireLease() error = %v", errLease)
++	}
++
++	shutdownDone := make(chan struct{})
++	go func() {
++		guarded.Shutdown()
++		close(shutdownDone)
++	}()
++	select {
++	case <-shutdownDone:
++		t.Fatal("guarded shutdown completed while a lease was active")
++	case <-time.After(50 * time.Millisecond):
++	}
++	if got := inner.shutdown.Load(); got != 0 {
++		t.Fatalf("shutdown calls while lease active = %d, want 0", got)
++	}
++
++	releaseLease()
++	releaseLease()
++	select {
++	case <-shutdownDone:
++	case <-time.After(time.Second):
++		t.Fatal("guarded shutdown did not complete after lease release")
++	}
++	if got := inner.shutdown.Load(); got != 1 {
++		t.Fatalf("shutdown calls after lease release = %d, want 1", got)
++	}
++	if _, errLease = guarded.acquireLease(); errLease == nil {
++		t.Fatal("acquireLease() succeeded after guarded client shutdown")
++	}
++}
+diff --git a/internal/pluginhost/host_callbacks.go b/internal/pluginhost/host_callbacks.go
+index 53c3bf5..b08666c 100644
+--- a/internal/pluginhost/host_callbacks.go
++++ b/internal/pluginhost/host_callbacks.go
+@@ -112,7 +112,7 @@ func (h *Host) callFromPlugin(ctx context.Context, method string, request []byte
+ 	case pluginabi.MethodHostHTTPStreamRead:
+ 		return h.callHostHTTPStreamRead(ctx, request)
+ 	case pluginabi.MethodHostHTTPStreamClose:
+-		return h.callHostHTTPStreamClose(request)
++		return h.callHostHTTPStreamClose(ctx, request)
+ 	case pluginabi.MethodHostStreamEmit:
+ 		return h.callHostStreamEmit(ctx, request)
+ 	case pluginabi.MethodHostStreamClose:
+@@ -144,8 +144,11 @@ func (h *Host) callHostHTTPDo(ctx context.Context, request []byte) ([]byte, erro
+ 	if errDecode != nil {
+ 		return nil, errDecode
+ 	}
+-	ctx = h.resolveCallbackContext(callbackID, ctx)
+-	resp, errDo := h.newHTTPClient(nil).Do(ctx, httpReq)
++	ctx, client, errResolve := h.resolveCallbackHTTP(ctx, callbackID)
++	if errResolve != nil {
++		return nil, errResolve
++	}
++	resp, errDo := client.Do(ctx, httpReq)
+ 	if errDo != nil {
+ 		return nil, errDo
+ 	}
+@@ -157,24 +160,35 @@ func (h *Host) callHostHTTPDoStream(ctx context.Context, request []byte) ([]byte
+ 	if errDecode != nil {
+ 		return nil, errDecode
+ 	}
+-	ctx = h.resolveCallbackContext(callbackID, ctx)
+-	if ctx == nil {
+-		ctx = context.Background()
++	ctx, client, errResolve := h.resolveCallbackHTTP(ctx, callbackID)
++	if errResolve != nil {
++		return nil, errResolve
+ 	}
+ 	streamCtx, cancel := context.WithCancel(ctx)
+-	resp, errDo := h.newHTTPClient(nil).DoStream(streamCtx, httpReq)
++	ownedCancel := cancel
++	defer func() {
++		if ownedCancel != nil {
++			ownedCancel()
++		}
++	}()
++	resp, errDo := client.DoStream(streamCtx, httpReq)
+ 	if errDo != nil {
+-		cancel()
+ 		return nil, errDo
+ 	}
+ 	streamID := ""
+ 	if h != nil && h.httpStreams != nil {
+-		streamID = h.httpStreams.open(resp.Chunks, cancel)
++		streamID = h.httpStreams.open(hostCallbackPluginIDFromContext(ctx), resp.Chunks, cancel)
+ 	}
+ 	if streamID == "" {
+-		cancel()
+ 		return nil, fmt.Errorf("host http stream bridge is unavailable")
+ 	}
++	ownedCancel = nil // The stream bridge now owns cancellation.
++	if callbackID != "" && !h.addCallbackCleanup(callbackID, func() {
++		h.httpStreams.close(streamID)
++	}) {
++		h.httpStreams.close(streamID)
++		return nil, fmt.Errorf("host callback context %s is unavailable", callbackID)
++	}
+ 	return marshalRPCResult(rpcHostHTTPStreamResponse{
+ 		StatusCode: resp.StatusCode,
+ 		Headers:    httpHeader(resp.Headers),
+@@ -190,7 +204,7 @@ func (h *Host) callHostHTTPStreamRead(ctx context.Context, request []byte) ([]by
+ 	if h == nil || h.httpStreams == nil {
+ 		return nil, fmt.Errorf("host http stream bridge is unavailable")
+ 	}
+-	chunk, done, errRead := h.httpStreams.read(ctx, req.StreamID)
++	chunk, done, errRead := h.httpStreams.read(ctx, req.StreamID, hostCallbackPluginIDFromContext(ctx))
+ 	if errRead != nil {
+ 		return nil, errRead
+ 	}
+@@ -205,13 +219,15 @@ func (h *Host) callHostHTTPStreamRead(ctx context.Context, request []byte) ([]by
+ 	return marshalRPCResult(resp)
+ }
+ 
+-func (h *Host) callHostHTTPStreamClose(request []byte) ([]byte, error) {
++func (h *Host) callHostHTTPStreamClose(ctx context.Context, request []byte) ([]byte, error) {
+ 	var req rpcHostHTTPStreamCloseRequest
+ 	if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+ 		return nil, fmt.Errorf("decode host http stream close request: %w", errUnmarshal)
+ 	}
+ 	if h != nil && h.httpStreams != nil {
+-		h.httpStreams.close(req.StreamID)
++		if errClose := h.httpStreams.closeForOwner(req.StreamID, hostCallbackPluginIDFromContext(ctx)); errClose != nil {
++			return nil, errClose
++		}
+ 	}
+ 	return marshalRPCResult(rpcEmptyResponse{})
+ }
+diff --git a/internal/pluginhost/host_model_stream_callbacks.go b/internal/pluginhost/host_model_stream_callbacks.go
+index be65e5f..452ac88 100644
+--- a/internal/pluginhost/host_model_stream_callbacks.go
++++ b/internal/pluginhost/host_model_stream_callbacks.go
+@@ -27,9 +27,14 @@ func (h *Host) callHostModelExecuteStream(ctx context.Context, request []byte) (
+ 	}
+ 	// Detach request cancellation while preserving callback values; callback cleanup owns the model stream lifetime.
+ 	streamCtx, cancel := context.WithCancel(context.WithoutCancel(callbackCtx))
++	ownedCancel := cancel
++	defer func() {
++		if ownedCancel != nil {
++			ownedCancel()
++		}
++	}()
+ 	stream, errMsg := executor.ExecuteModelStream(streamCtx, modelExecutionRequestFromPlugin(req.HostModelExecutionRequest, skipPluginID))
+ 	if errMsg != nil {
+-		cancel()
+ 		return nil, modelExecutionError(errMsg)
+ 	}
+ 	streamID := ""
+@@ -37,13 +42,14 @@ func (h *Host) callHostModelExecuteStream(ctx context.Context, request []byte) (
+ 		streamID = h.modelStreams.open(req.HostCallbackID, stream.Chunks, cancel)
+ 	}
+ 	if streamID == "" {
+-		cancel()
+ 		return nil, fmt.Errorf("host model stream bridge is unavailable")
+ 	}
+-	if req.HostCallbackID != "" {
+-		h.addCallbackCleanup(req.HostCallbackID, func() {
+-			h.modelStreams.close(streamID)
+-		})
++	ownedCancel = nil // The stream bridge now owns cancellation.
++	if req.HostCallbackID != "" && !h.addCallbackCleanup(req.HostCallbackID, func() {
++		h.modelStreams.close(streamID)
++	}) {
++		h.modelStreams.close(streamID)
++		return nil, fmt.Errorf("host callback context %s is unavailable", req.HostCallbackID)
+ 	}
+ 	return marshalRPCResult(pluginapi.HostModelStreamResponse{
+ 		StatusCode: stream.StatusCode,
+diff --git a/internal/pluginhost/host_model_stream_callbacks_test.go b/internal/pluginhost/host_model_stream_callbacks_test.go
+index bc8f292..db4bb64 100644
+--- a/internal/pluginhost/host_model_stream_callbacks_test.go
++++ b/internal/pluginhost/host_model_stream_callbacks_test.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"net/http"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+@@ -74,3 +75,52 @@ func TestHostModelExecuteStreamDetachesFromCallbackParentCancel(t *testing.T) {
+ 		t.Fatal("stream context was not canceled after callback scope closed")
+ 	}
+ }
++
++func TestHostModelExecuteStreamCleanupRegistrationFailureClosesStream(t *testing.T) {
++	host := New()
++	ctxSeen := make(chan context.Context, 1)
++	callbackID, closeCallback := host.openCallbackContext(context.Background())
++	host.SetModelExecutor(&fakeHostModelExecutor{
++		executeModelStream: func(ctx context.Context, req handlers.ModelExecutionRequest) (handlers.ModelExecutionStream, *interfaces.ErrorMessage) {
++			ctxSeen <- ctx
++			closeCallback()
++			return handlers.ModelExecutionStream{
++				StatusCode: http.StatusOK,
++				Chunks:     make(chan handlers.ModelExecutionChunk),
++			}, nil
++		},
++	})
++
++	rawReq, errMarshal := json.Marshal(rpcHostModelExecutionRequest{
++		HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
++			EntryProtocol: "openai",
++			ExitProtocol:  "openai",
++			Model:         "model-1",
++			Stream:        true,
++			Body:          []byte(`{"stream":true}`),
++		},
++		HostCallbackID: callbackID,
++	})
++	if errMarshal != nil {
++		t.Fatalf("marshal request: %v", errMarshal)
++	}
++	_, errCall := host.callFromPlugin(context.Background(), pluginabi.MethodHostModelExecuteStream, rawReq)
++	if errCall == nil || !strings.Contains(errCall.Error(), "is unavailable") {
++		t.Fatalf("callFromPlugin() error = %v, want unavailable callback context", errCall)
++	}
++
++	var streamCtx context.Context
++	select {
++	case streamCtx = <-ctxSeen:
++	case <-time.After(time.Second):
++		t.Fatal("model executor was not called")
++	}
++	select {
++	case <-streamCtx.Done():
++	case <-time.After(time.Second):
++		t.Fatal("model stream context was not canceled after cleanup registration failed")
++	}
++	if got := hostModelStreamCountForTest(t, host); got != 0 {
++		t.Fatalf("model stream count = %d, want 0", got)
++	}
++}
+diff --git a/internal/pluginhost/host_test.go b/internal/pluginhost/host_test.go
+index 788a285..6b414fa 100644
+--- a/internal/pluginhost/host_test.go
++++ b/internal/pluginhost/host_test.go
+@@ -1119,7 +1119,7 @@ func TestHostCanceledInitializationDiscardsBlockedClient(t *testing.T) {
+ 
+ 	close(client.release)
+ 	deadline := time.Now().Add(time.Second)
+-	for client.shutdown.Load() == 0 && time.Now().Before(deadline) {
++	for (client.shutdown.Load() == 0 || h.PluginBusy("alpha")) && time.Now().Before(deadline) {
+ 		time.Sleep(time.Millisecond)
+ 	}
+ 	if got := client.shutdown.Load(); got != 1 {
+@@ -1159,7 +1159,7 @@ func TestHostCancellationUnderMutationLockDoesNotInsertLoadedPlugin(t *testing.T
+ 	waitForHostTestSignal(t, applyDone, "canceled plugin apply")
+ 
+ 	deadline := time.Now().Add(time.Second)
+-	for client.shutdown.Load() == 0 && time.Now().Before(deadline) {
++	for (client.shutdown.Load() == 0 || h.PluginBusy("alpha")) && time.Now().Before(deadline) {
+ 		time.Sleep(time.Millisecond)
+ 	}
+ 	if got := client.shutdown.Load(); got != 1 {
+@@ -1216,7 +1216,7 @@ func TestHostCanceledLoadDiscardsLateClientWithoutReplacingCurrentPlugin(t *test
+ 
+ 	close(loader.firstRelease)
+ 	deadline := time.Now().Add(time.Second)
+-	for first.shutdown.Load() == 0 && time.Now().Before(deadline) {
++	for (first.shutdown.Load() == 0 || h.PluginBusy("alpha")) && time.Now().Before(deadline) {
+ 		time.Sleep(time.Millisecond)
+ 	}
+ 	if got := first.shutdown.Load(); got != 1 {
+@@ -1263,7 +1263,7 @@ func TestHostCanceledBlockedLoadKeepsOneLoaderAndCleanupPerPlugin(t *testing.T)
+ 
+ 	close(loader.firstRelease)
+ 	deadline := time.Now().Add(time.Second)
+-	for first.shutdown.Load() == 0 && time.Now().Before(deadline) {
++	for (first.shutdown.Load() == 0 || h.PluginBusy("alpha")) && time.Now().Before(deadline) {
+ 		time.Sleep(time.Millisecond)
+ 	}
+ 	if got := first.shutdown.Load(); got != 1 {
+diff --git a/internal/pluginhost/http_bridge.go b/internal/pluginhost/http_bridge.go
+index edd279b..449c1d8 100644
+--- a/internal/pluginhost/http_bridge.go
++++ b/internal/pluginhost/http_bridge.go
+@@ -3,9 +3,12 @@ package pluginhost
+ import (
+ 	"bytes"
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"net/http"
++	"net/url"
++	"strings"
+ 
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
+@@ -127,6 +130,7 @@ func (c *hostHTTPClient) doHTTP(ctx context.Context, req pluginapi.HTTPRequest)
+ 	if client == nil {
+ 		client = &http.Client{}
+ 	}
++	client.CheckRedirect = checkHostHTTPRedirect
+ 	resp, errDo := client.Do(httpReq)
+ 	if errDo != nil {
+ 		helps.RecordAPIResponseError(ctx, cfg, errDo)
+@@ -135,6 +139,23 @@ func (c *hostHTTPClient) doHTTP(ctx context.Context, req pluginapi.HTTPRequest)
+ 	return resp, cfg, nil
+ }
+ 
++func checkHostHTTPRedirect(req *http.Request, via []*http.Request) error {
++	if len(via) >= 10 {
++		return errors.New("stopped after 10 redirects")
++	}
++	if len(via) > 0 && !sameHTTPOrigin(req.URL, via[0].URL) {
++		return http.ErrUseLastResponse
++	}
++	return nil
++}
++
++func sameHTTPOrigin(a, b *url.URL) bool {
++	if a == nil || b == nil {
++		return false
++	}
++	return strings.EqualFold(a.Scheme, b.Scheme) && strings.EqualFold(a.Host, b.Host)
++}
++
+ func (c *hostHTTPClient) recordHTTPRequest(ctx context.Context, cfg *config.Config, req *http.Request, body []byte) {
+ 	if req == nil {
+ 		return
+diff --git a/internal/pluginhost/http_bridge_test.go b/internal/pluginhost/http_bridge_test.go
+new file mode 100644
+index 0000000..c2ab81a
+--- /dev/null
++++ b/internal/pluginhost/http_bridge_test.go
+@@ -0,0 +1,107 @@
++package pluginhost
++
++import (
++	"context"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"sync/atomic"
++	"testing"
++
++	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
++)
++
++func TestHostHTTPClientDoesNotFollowCrossOriginRedirect(t *testing.T) {
++	for _, status := range []int{
++		http.StatusMovedPermanently,
++		http.StatusFound,
++		http.StatusSeeOther,
++		http.StatusTemporaryRedirect,
++		http.StatusPermanentRedirect,
++	} {
++		t.Run(http.StatusText(status), func(t *testing.T) {
++			var redirectedRequests atomic.Int32
++			destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				redirectedRequests.Add(1)
++				if got := r.Header.Get("X-Api-Key"); got != "" {
++					t.Errorf("redirected X-Api-Key = %q, want empty", got)
++				}
++				if got := r.Header.Get("X-Goog-Api-Key"); got != "" {
++					t.Errorf("redirected X-Goog-Api-Key = %q, want empty", got)
++				}
++				if got := r.Header.Get("X-Provider-Secret"); got != "" {
++					t.Errorf("redirected X-Provider-Secret = %q, want empty", got)
++				}
++				w.WriteHeader(http.StatusNoContent)
++			}))
++			defer destination.Close()
++
++			source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				if got := r.Header.Get("X-Api-Key"); got != "openai-secret" {
++					t.Errorf("source X-Api-Key = %q, want openai-secret", got)
++				}
++				if got := r.Header.Get("X-Goog-Api-Key"); got != "gemini-secret" {
++					t.Errorf("source X-Goog-Api-Key = %q, want gemini-secret", got)
++				}
++				if got := r.Header.Get("X-Provider-Secret"); got != "custom-secret" {
++					t.Errorf("source X-Provider-Secret = %q, want custom-secret", got)
++				}
++				http.Redirect(w, r, destination.URL+"/capture", status)
++			}))
++			defer source.Close()
++
++			resp, err := New().newHTTPClient(nil).Do(context.Background(), pluginapi.HTTPRequest{
++				Method: http.MethodPost,
++				URL:    source.URL + "/start",
++				Headers: http.Header{
++					"X-Api-Key":         []string{"openai-secret"},
++					"X-Goog-Api-Key":    []string{"gemini-secret"},
++					"X-Provider-Secret": []string{"custom-secret"},
++				},
++				Body: []byte(`{"request":true}`),
++			})
++			if err != nil {
++				t.Fatalf("Do() error = %v", err)
++			}
++			if resp.StatusCode != status {
++				t.Fatalf("status = %d, want %d", resp.StatusCode, status)
++			}
++			if got := resp.Headers.Get("Location"); got != destination.URL+"/capture" {
++				t.Fatalf("Location = %q, want %q", got, destination.URL+"/capture")
++			}
++			if got := redirectedRequests.Load(); got != 0 {
++				t.Fatalf("redirected requests = %d, want 0", got)
++			}
++		})
++	}
++}
++
++func TestSameHTTPOrigin(t *testing.T) {
++	tests := []struct {
++		name string
++		a    string
++		b    string
++		want bool
++	}{
++		{name: "same", a: "https://example.com/start", b: "https://example.com/next", want: true},
++		{name: "host case", a: "https://EXAMPLE.com/start", b: "https://example.com/next", want: true},
++		{name: "scheme", a: "http://example.com/start", b: "https://example.com/next", want: false},
++		{name: "port", a: "https://example.com:8443/start", b: "https://example.com/next", want: false},
++		{name: "explicit default port", a: "https://example.com:443/start", b: "https://example.com/next", want: false},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			a, err := url.Parse(tt.a)
++			if err != nil {
++				t.Fatalf("parse a: %v", err)
++			}
++			b, err := url.Parse(tt.b)
++			if err != nil {
++				t.Fatalf("parse b: %v", err)
++			}
++			if got := sameHTTPOrigin(a, b); got != tt.want {
++				t.Fatalf("sameHTTPOrigin(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.want)
++			}
++		})
++	}
++}
+diff --git a/internal/pluginhost/http_stream_bridge.go b/internal/pluginhost/http_stream_bridge.go
+index 48b0653..7a116eb 100644
+--- a/internal/pluginhost/http_stream_bridge.go
++++ b/internal/pluginhost/http_stream_bridge.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"strconv"
++	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 
+@@ -17,15 +18,16 @@ type hostHTTPStreamBridge struct {
+ }
+ 
+ type hostHTTPStreamEntry struct {
+-	chunks <-chan pluginapi.HTTPStreamChunk
+-	cancel context.CancelFunc
++	ownerPluginID string
++	chunks        <-chan pluginapi.HTTPStreamChunk
++	cancel        context.CancelFunc
+ }
+ 
+ func newHostHTTPStreamBridge() *hostHTTPStreamBridge {
+ 	return &hostHTTPStreamBridge{streams: make(map[string]hostHTTPStreamEntry)}
+ }
+ 
+-func (b *hostHTTPStreamBridge) open(chunks <-chan pluginapi.HTTPStreamChunk, cancel context.CancelFunc) string {
++func (b *hostHTTPStreamBridge) open(ownerPluginID string, chunks <-chan pluginapi.HTTPStreamChunk, cancel context.CancelFunc) string {
+ 	if b == nil || chunks == nil {
+ 		if cancel != nil {
+ 			cancel()
+@@ -34,12 +36,16 @@ func (b *hostHTTPStreamBridge) open(chunks <-chan pluginapi.HTTPStreamChunk, can
+ 	}
+ 	id := strconv.FormatUint(b.next.Add(1), 10)
+ 	b.mu.Lock()
+-	b.streams[id] = hostHTTPStreamEntry{chunks: chunks, cancel: cancel}
++	b.streams[id] = hostHTTPStreamEntry{
++		ownerPluginID: strings.TrimSpace(ownerPluginID),
++		chunks:        chunks,
++		cancel:        cancel,
++	}
+ 	b.mu.Unlock()
+ 	return id
+ }
+ 
+-func (b *hostHTTPStreamBridge) read(ctx context.Context, id string) (pluginapi.HTTPStreamChunk, bool, error) {
++func (b *hostHTTPStreamBridge) read(ctx context.Context, id, ownerPluginID string) (pluginapi.HTTPStreamChunk, bool, error) {
+ 	if b == nil || id == "" {
+ 		return pluginapi.HTTPStreamChunk{}, true, fmt.Errorf("http stream id is required")
+ 	}
+@@ -49,6 +55,9 @@ func (b *hostHTTPStreamBridge) read(ctx context.Context, id string) (pluginapi.H
+ 	if entry.chunks == nil {
+ 		return pluginapi.HTTPStreamChunk{}, true, fmt.Errorf("http stream %s is not open", id)
+ 	}
++	if entry.ownerPluginID != strings.TrimSpace(ownerPluginID) {
++		return pluginapi.HTTPStreamChunk{}, true, fmt.Errorf("http stream %s belongs to another plugin", id)
++	}
+ 	if ctx == nil {
+ 		ctx = context.Background()
+ 	}
+@@ -69,6 +78,24 @@ func (b *hostHTTPStreamBridge) read(ctx context.Context, id string) (pluginapi.H
+ 	}
+ }
+ 
++func (b *hostHTTPStreamBridge) closeForOwner(id, ownerPluginID string) error {
++	if b == nil || id == "" {
++		return nil
++	}
++	b.mu.Lock()
++	entry, exists := b.streams[id]
++	if exists && entry.ownerPluginID != strings.TrimSpace(ownerPluginID) {
++		b.mu.Unlock()
++		return fmt.Errorf("http stream %s belongs to another plugin", id)
++	}
++	delete(b.streams, id)
++	b.mu.Unlock()
++	if entry.cancel != nil {
++		entry.cancel()
++	}
++	return nil
++}
++
+ func (b *hostHTTPStreamBridge) close(id string) {
+ 	if b == nil || id == "" {
+ 		return
+diff --git a/internal/pluginhost/loader_unix.go b/internal/pluginhost/loader_unix.go
+index 9cfb08c..f2b190d 100644
+--- a/internal/pluginhost/loader_unix.go
++++ b/internal/pluginhost/loader_unix.go
+@@ -99,7 +99,7 @@ type dynamicLibraryLoader struct{}
+ 
+ type dynamicLibraryClient struct {
+ 	handle  unsafe.Pointer
+-	hostAPI *C.cliproxy_host_api
++	hostAPI unsafe.Pointer
+ 	hostCtx unsafe.Pointer
+ 	api     C.cliproxy_plugin_api
+ }
+@@ -143,9 +143,13 @@ func (dynamicLibraryLoader) Open(file pluginFile, host *Host) (pluginClient, err
+ 
+ 	client := &dynamicLibraryClient{
+ 		handle:  handle,
+-		hostAPI: hostAPI,
++		hostAPI: unsafe.Pointer(hostAPI),
+ 		hostCtx: hostCtx,
+ 	}
++	// After entering a Go c-shared plugin's init function, its runtime may retain
++	// the host API or start goroutines even when registration later fails. All
++	// post-init failures therefore use Shutdown, which detaches the client but
++	// deliberately keeps the module and host callback allocations mapped.
+ 	rc := C.cliproxy_call_init(initSymbol, hostAPI, &client.api)
+ 	if rc != 0 {
+ 		client.Shutdown()
+@@ -203,24 +207,21 @@ func (c *dynamicLibraryClient) Shutdown() {
+ 	if c == nil {
+ 		return
+ 	}
++	// Go c-shared modules are not safe to hot-unload: plugin goroutines may still
++	// be unwinding from a host callback after the exported call has returned.
++	// Keep the module, host API, and host context allocated for process lifetime,
++	// while revoking callbacks and clearing the client so it cannot be reused.
+ 	if c.api.shutdown != nil {
+ 		C.cliproxy_shutdown_plugin(c.api.shutdown)
+-		c.api.shutdown = nil
+ 	}
+ 	if c.hostCtx != nil {
+ 		id := uintptr(*(*C.uintptr_t)(c.hostCtx))
+ 		hostCallbackEntries.Delete(id)
+-		C.free(c.hostCtx)
+-		c.hostCtx = nil
+-	}
+-	if c.hostAPI != nil {
+-		C.free(unsafe.Pointer(c.hostAPI))
+-		c.hostAPI = nil
+-	}
+-	if c.handle != nil {
+-		C.cliproxy_dlclose(c.handle)
+-		c.handle = nil
+ 	}
++	c.api = C.cliproxy_plugin_api{}
++	c.hostCtx = nil
++	c.hostAPI = nil
++	c.handle = nil
+ }
+ 
+ func dlerrorString() string {
+diff --git a/internal/pluginhost/loader_unix_test.go b/internal/pluginhost/loader_unix_test.go
+new file mode 100644
+index 0000000..a1582a3
+--- /dev/null
++++ b/internal/pluginhost/loader_unix_test.go
+@@ -0,0 +1,37 @@
++//go:build cgo && (linux || darwin || freebsd)
++
++package pluginhost
++
++import (
++	"testing"
++	"unsafe"
++)
++
++func TestDynamicLibraryClientShutdownDetachesWithoutReleasingNativeState(t *testing.T) {
++	handleMarker := byte(1)
++	hostAPIMarker := byte(2)
++	id := hostCallbackID.Add(1)
++	hostCtx := uintptr(id)
++	hostCallbackEntries.Store(id, dynamicHostCallbackEntry{host: New(), pluginID: "retained-plugin"})
++
++	client := &dynamicLibraryClient{
++		handle:  unsafe.Pointer(&handleMarker),
++		hostAPI: unsafe.Pointer(&hostAPIMarker),
++		hostCtx: unsafe.Pointer(&hostCtx),
++	}
++	client.Shutdown()
++
++	if _, exists := hostCallbackEntries.Load(id); exists {
++		t.Fatal("host callback registry entry remained after shutdown")
++	}
++	if client.handle != nil || client.hostAPI != nil || client.hostCtx != nil {
++		t.Fatalf("client native fields were not cleared: %#v", client)
++	}
++	if client.api.call != nil || client.api.free_buffer != nil || client.api.shutdown != nil {
++		t.Fatal("plugin function table remained callable after shutdown")
++	}
++
++	// Shutdown must stay idempotent after the retained native pointers have been
++	// detached from the Go client.
++	client.Shutdown()
++}
+diff --git a/internal/pluginhost/loader_windows.go b/internal/pluginhost/loader_windows.go
+index a0bd9f0..9f6d695 100644
+--- a/internal/pluginhost/loader_windows.go
++++ b/internal/pluginhost/loader_windows.go
+@@ -40,11 +40,13 @@ type windowsPluginAPI struct {
+ }
+ 
+ var (
+-	windowsHostCallbackID      atomic.Uintptr
+-	windowsHostCallbackEntries sync.Map
+-	windowsHostCallCallback    = syscall.NewCallback(windowsHostCall)
+-	windowsHostFreeCallback    = syscall.NewCallback(windowsHostFree)
+-	shadowPluginCleanupOnce    sync.Once
++	windowsHostCallbackID       atomic.Uintptr
++	windowsHostCallbackEntries  sync.Map
++	windowsHostCallCallback     = syscall.NewCallback(windowsHostCall)
++	windowsHostFreeCallback     = syscall.NewCallback(windowsHostFree)
++	windowsRetainedPluginMu     sync.Mutex
++	windowsRetainedPluginStates []windowsRetainedPluginState
++	shadowPluginCleanupOnce     sync.Once
+ )
+ 
+ const (
+@@ -56,12 +58,19 @@ const (
+ 
+ type dynamicLibraryLoader struct{}
+ 
++type windowsRetainedPluginState struct {
++	dll     *syscall.DLL
++	hostAPI *windowsHostAPI
++	hostCtx *uintptr
++}
++
+ type dynamicLibraryClient struct {
+-	dll      *syscall.DLL
+-	tempPath string
+-	hostAPI  *windowsHostAPI
+-	hostCtx  *uintptr
+-	api      windowsPluginAPI
++	closeOnce sync.Once
++	dll       *syscall.DLL
++	tempPath  string
++	hostAPI   *windowsHostAPI
++	hostCtx   *uintptr
++	api       windowsPluginAPI
+ }
+ 
+ func defaultPluginLoader() pluginLoader {
+@@ -99,17 +108,21 @@ func (dynamicLibraryLoader) Open(file pluginFile, host *Host) (pluginClient, err
+ 			freeBuffer: windowsHostFreeCallback,
+ 		},
+ 	}
++	// After entering a Go DLL's init function, its runtime may retain the host
++	// API or start goroutines even when registration later fails. Every failure
++	// from this point uses Shutdown, which detaches the client while retaining
++	// the DLL and callback allocations for process lifetime.
+ 	rc, _, errCall := proc.Call(uintptr(unsafe.Pointer(client.hostAPI)), uintptr(unsafe.Pointer(&client.api)))
+ 	if rc != 0 {
+-		client.closeAfterOpenFailure()
++		client.Shutdown()
+ 		return nil, fmt.Errorf("cliproxy_plugin_init returned %d: %v", rc, errCall)
+ 	}
+ 	if client.api.abiVersion != pluginHostABIVersion {
+-		client.closeAfterOpenFailure()
++		client.Shutdown()
+ 		return nil, fmt.Errorf("plugin ABI version %d is not supported", client.api.abiVersion)
+ 	}
+ 	if client.api.call == 0 || client.api.freeBuffer == 0 {
+-		client.closeAfterOpenFailure()
++		client.Shutdown()
+ 		return nil, fmt.Errorf("plugin function table is incomplete")
+ 	}
+ 	return client, nil
+@@ -308,36 +321,41 @@ func (c *dynamicLibraryClient) Call(ctx context.Context, method string, request
+ }
+ 
+ func (c *dynamicLibraryClient) Shutdown() {
+-	// Windows Go DLLs are not safe to hot-unload from the host process.
+-	// The plugin was loaded from a shadow copy, so keeping the module mapped
+-	// does not block deleting or replacing the source artifact.
+-	c.close(false)
+-}
+-
+-func (c *dynamicLibraryClient) closeAfterOpenFailure() {
+-	c.close(true)
+-}
+-
+-func (c *dynamicLibraryClient) close(releaseDLL bool) {
+ 	if c == nil {
+ 		return
+ 	}
+-	if c.api.shutdown != 0 {
+-		_, _, _ = syscall.SyscallN(c.api.shutdown)
+-		c.api.shutdown = 0
+-	}
+-	if c.hostCtx != nil {
+-		windowsHostCallbackEntries.Delete(*c.hostCtx)
+-		c.hostCtx = nil
+-	}
+-	if c.dll != nil {
+-		if releaseDLL {
+-			_ = c.dll.Release()
++	c.closeOnce.Do(func() {
++		// Windows Go DLLs are not safe to hot-unload. Retain both the module and
++		// the Go heap objects whose addresses were passed through the ABI, so a
++		// late plugin callback can fail closed without dereferencing reclaimed
++		// memory. Shadow copies can still be removed or replaced independently.
++		retainWindowsPluginState(c.dll, c.hostAPI, c.hostCtx)
++		if c.api.shutdown != 0 {
++			_, _, _ = syscall.SyscallN(c.api.shutdown)
++		}
++		if c.hostCtx != nil {
++			windowsHostCallbackEntries.Delete(*c.hostCtx)
+ 		}
++		c.api = windowsPluginAPI{}
++		c.hostCtx = nil
++		c.hostAPI = nil
+ 		c.dll = nil
++		removeShadowPlugin(c.tempPath)
++		c.tempPath = ""
++	})
++}
++
++func retainWindowsPluginState(dll *syscall.DLL, hostAPI *windowsHostAPI, hostCtx *uintptr) {
++	if dll == nil && hostAPI == nil && hostCtx == nil {
++		return
+ 	}
+-	removeShadowPlugin(c.tempPath)
+-	c.tempPath = ""
++	windowsRetainedPluginMu.Lock()
++	windowsRetainedPluginStates = append(windowsRetainedPluginStates, windowsRetainedPluginState{
++		dll:     dll,
++		hostAPI: hostAPI,
++		hostCtx: hostCtx,
++	})
++	windowsRetainedPluginMu.Unlock()
+ }
+ 
+ func windowsHostCall(hostCtx uintptr, methodPtr uintptr, requestPtr uintptr, requestLen uintptr, responsePtr uintptr) uintptr {
+diff --git a/internal/pluginhost/loader_windows_test.go b/internal/pluginhost/loader_windows_test.go
+index 06b160f..d82d748 100644
+--- a/internal/pluginhost/loader_windows_test.go
++++ b/internal/pluginhost/loader_windows_test.go
+@@ -9,7 +9,9 @@ import (
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
++	"runtime"
+ 	"strings"
++	"sync"
+ 	"syscall"
+ 	"testing"
+ 	"unsafe"
+@@ -19,6 +21,69 @@ import (
+ 
+ var testReentrantHostCallback uintptr
+ 
++func TestDynamicLibraryClientShutdownRetainsWindowsABIState(t *testing.T) {
++	id := windowsHostCallbackID.Add(1)
++	dll := &syscall.DLL{}
++	hostCtx := new(uintptr)
++	*hostCtx = id
++	hostAPI := &windowsHostAPI{
++		abiVersion: pluginHostABIVersion,
++		hostCtx:    uintptr(unsafe.Pointer(hostCtx)),
++		call:       windowsHostCallCallback,
++		freeBuffer: windowsHostFreeCallback,
++	}
++	windowsHostCallbackEntries.Store(id, dynamicHostCallbackEntry{host: New(), pluginID: "retained-plugin"})
++	client := &dynamicLibraryClient{dll: dll, hostAPI: hostAPI, hostCtx: hostCtx}
++
++	windowsRetainedPluginMu.Lock()
++	retainedBefore := len(windowsRetainedPluginStates)
++	windowsRetainedPluginMu.Unlock()
++	wantDLL := uintptr(unsafe.Pointer(dll))
++	wantHostAPI := uintptr(unsafe.Pointer(hostAPI))
++	wantHostCtx := uintptr(unsafe.Pointer(hostCtx))
++
++	var shutdowns sync.WaitGroup
++	for range 8 {
++		shutdowns.Add(1)
++		go func() {
++			defer shutdowns.Done()
++			client.Shutdown()
++		}()
++	}
++	shutdowns.Wait()
++	client.Shutdown()
++	if _, exists := windowsHostCallbackEntries.Load(id); exists {
++		t.Fatal("host callback registry entry remained after shutdown")
++	}
++	if client.dll != nil || client.hostAPI != nil || client.hostCtx != nil {
++		t.Fatalf("client native fields were not cleared: %#v", client)
++	}
++	if client.api != (windowsPluginAPI{}) {
++		t.Fatalf("plugin function table remained callable: %#v", client.api)
++	}
++
++	dll = nil
++	hostAPI = nil
++	hostCtx = nil
++	runtime.GC()
++	windowsRetainedPluginMu.Lock()
++	if len(windowsRetainedPluginStates) != retainedBefore+1 {
++		retained := len(windowsRetainedPluginStates)
++		windowsRetainedPluginMu.Unlock()
++		t.Fatalf("retained plugin states = %d, want %d", retained, retainedBefore+1)
++	}
++	retained := windowsRetainedPluginStates[retainedBefore]
++	windowsRetainedPluginMu.Unlock()
++	if uintptr(unsafe.Pointer(retained.dll)) != wantDLL ||
++		uintptr(unsafe.Pointer(retained.hostAPI)) != wantHostAPI ||
++		uintptr(unsafe.Pointer(retained.hostCtx)) != wantHostCtx {
++		t.Fatalf("retained state pointers changed: %#v", retained)
++	}
++	if retained.hostCtx == nil || *retained.hostCtx != id {
++		t.Fatalf("retained host context = %v, want callback id %d", retained.hostCtx, id)
++	}
++}
++
+ func TestDynamicLibraryClientCallSurvivesReentrantCallbackStackGrowth(t *testing.T) {
+ 	testReentrantHostCallback = syscall.NewCallback(testGrowHostCallbackStack)
+ 	client := newGuardedPluginClient(&dynamicLibraryClient{api: windowsPluginAPI{
+diff --git a/internal/pluginhost/rpc_client.go b/internal/pluginhost/rpc_client.go
+index 10f767a..3cdd68a 100644
+--- a/internal/pluginhost/rpc_client.go
++++ b/internal/pluginhost/rpc_client.go
+@@ -37,6 +37,7 @@ type rpcThinkingApplier struct {
+ 
+ type rpcPluginError struct {
+ 	message    string
++	code       string
+ 	statusCode int
+ }
+ 
+@@ -48,6 +49,10 @@ func (e rpcPluginError) StatusCode() int {
+ 	return e.statusCode
+ }
+ 
++func (e rpcPluginError) IsRequestScoped() bool {
++	return strings.EqualFold(strings.TrimSpace(e.code), "request_scoped")
++}
++
+ type rpcResponseNormalizer struct {
+ 	*rpcPluginAdapter
+ 	method string
+@@ -292,10 +297,11 @@ func decodeEnvelopeResult[T any](envelope pluginabi.Envelope) (T, error) {
+ 			if message == "" {
+ 				message = "plugin call failed"
+ 			}
+-			if envelope.Error.HTTPStatus > 0 {
+-				return zero, rpcPluginError{message: message, statusCode: envelope.Error.HTTPStatus}
++			return zero, rpcPluginError{
++				message:    message,
++				code:       strings.TrimSpace(envelope.Error.Code),
++				statusCode: envelope.Error.HTTPStatus,
+ 			}
+-			return zero, fmt.Errorf("%s", message)
+ 		}
+ 		return zero, fmt.Errorf("plugin call failed")
+ 	}
+@@ -328,10 +334,14 @@ func marshalRPCError(code, message string) []byte {
+ }
+ 
+ func (a *rpcPluginAdapter) openHostCallbackContext(ctx context.Context) (string, func()) {
++	return a.openHostCallbackContextWithHTTPClient(ctx, nil)
++}
++
++func (a *rpcPluginAdapter) openHostCallbackContextWithHTTPClient(ctx context.Context, httpClient pluginapi.HostHTTPClient) (string, func()) {
+ 	if a == nil || a.host == nil {
+ 		return "", func() {}
+ 	}
+-	return a.host.openCallbackContextForPlugin(ctx, a.id)
++	return a.host.openCallbackContextForPluginWithHTTPClient(ctx, a.id, httpClient)
+ }
+ 
+ func (a *rpcPluginAdapter) RegisterModels(ctx context.Context, req pluginapi.ModelRegistrationRequest) (pluginapi.ModelRegistrationResponse, error) {
+@@ -424,7 +434,7 @@ func (a *rpcPluginAdapter) Authenticate(ctx context.Context, req pluginapi.Front
+ }
+ 
+ func (a *rpcPluginAdapter) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+-	callbackID, closeCallback := a.openHostCallbackContext(ctx)
++	callbackID, closeCallback := a.openHostCallbackContextWithHTTPClient(ctx, req.HTTPClient)
+ 	defer closeCallback()
+ 	return callPlugin[pluginapi.ExecutorResponse](ctx, a.client, pluginabi.MethodExecutorExecute, rpcExecutorRequest{
+ 		ExecutorRequest: req,
+@@ -433,7 +443,7 @@ func (a *rpcPluginAdapter) Execute(ctx context.Context, req pluginapi.ExecutorRe
+ }
+ 
+ func (a *rpcPluginAdapter) CountTokens(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
+-	callbackID, closeCallback := a.openHostCallbackContext(ctx)
++	callbackID, closeCallback := a.openHostCallbackContextWithHTTPClient(ctx, req.HTTPClient)
+ 	defer closeCallback()
+ 	return callPlugin[pluginapi.ExecutorResponse](ctx, a.client, pluginabi.MethodExecutorCountTokens, rpcExecutorRequest{
+ 		ExecutorRequest: req,
+@@ -442,7 +452,7 @@ func (a *rpcPluginAdapter) CountTokens(ctx context.Context, req pluginapi.Execut
+ }
+ 
+ func (a *rpcPluginAdapter) HttpRequest(ctx context.Context, req pluginapi.ExecutorHTTPRequest) (pluginapi.ExecutorHTTPResponse, error) {
+-	callbackID, closeCallback := a.openHostCallbackContext(ctx)
++	callbackID, closeCallback := a.openHostCallbackContextWithHTTPClient(ctx, req.HTTPClient)
+ 	defer closeCallback()
+ 	return callPlugin[pluginapi.ExecutorHTTPResponse](ctx, a.client, pluginabi.MethodExecutorHTTPRequest, rpcExecutorHTTPRequest{
+ 		ExecutorHTTPRequest: req,
+diff --git a/internal/pluginhost/rpc_client_error_test.go b/internal/pluginhost/rpc_client_error_test.go
+index a74e6bb..84b2b44 100644
+--- a/internal/pluginhost/rpc_client_error_test.go
++++ b/internal/pluginhost/rpc_client_error_test.go
+@@ -43,6 +43,39 @@ func TestDecodeEnvelopeResultPreservesPluginHTTPStatus(t *testing.T) {
+ 	}
+ }
+ 
++func TestDecodeEnvelopeResultPreservesPluginRequestScope(t *testing.T) {
++	tests := []struct {
++		name      string
++		code      string
++		wantScope bool
++	}{
++		{name: "request scoped", code: "request_scoped", wantScope: true},
++		{name: "ordinary plugin error", code: "plugin_error", wantScope: false},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			_, errDecode := decodeEnvelopeResult[rpcEmptyResponse](pluginabi.Envelope{
++				OK: false,
++				Error: &pluginabi.Error{
++					Code:       tt.code,
++					Message:    "upstream rejected request",
++					HTTPStatus: http.StatusBadRequest,
++				},
++			})
++			if errDecode == nil {
++				t.Fatal("decodeEnvelopeResult returned nil error")
++			}
++			requestScoped, ok := errDecode.(interface{ IsRequestScoped() bool })
++			if !ok {
++				t.Fatalf("error %T does not expose IsRequestScoped", errDecode)
++			}
++			if got := requestScoped.IsRequestScoped(); got != tt.wantScope {
++				t.Fatalf("IsRequestScoped() = %v, want %v", got, tt.wantScope)
++			}
++		})
++	}
++}
++
+ func TestCallPluginReturnsPluginErrorWithoutMethodWrapper(t *testing.T) {
+ 	raw, errMarshal := json.Marshal(pluginabi.Envelope{
+ 		OK: false,
+diff --git a/internal/pluginhost/rpc_client_http_client_test.go b/internal/pluginhost/rpc_client_http_client_test.go
+new file mode 100644
+index 0000000..3209d8f
+--- /dev/null
++++ b/internal/pluginhost/rpc_client_http_client_test.go
+@@ -0,0 +1,516 @@
++package pluginhost
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
++	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
++)
++
++const callbackHTTPClientTestURL = "callback-client://upstream.test/request"
++
++func TestRPCExecutorCallbacksUseCallingHTTPClient(t *testing.T) {
++	for _, method := range []string{
++		pluginabi.MethodExecutorExecute,
++		pluginabi.MethodExecutorCountTokens,
++		pluginabi.MethodExecutorHTTPRequest,
++	} {
++		t.Run(method, func(t *testing.T) {
++			host := New()
++			boundClient := &callbackRecordingHTTPClient{}
++			pluginClient := &executorHTTPCallbackPluginClient{host: host}
++			adapter := &rpcPluginAdapter{id: "http-callback-plugin", host: host, client: pluginClient}
++
++			var body []byte
++			var err error
++			switch method {
++			case pluginabi.MethodExecutorExecute:
++				var response pluginapi.ExecutorResponse
++				response, err = adapter.Execute(context.Background(), pluginapi.ExecutorRequest{HTTPClient: boundClient})
++				body = response.Payload
++			case pluginabi.MethodExecutorCountTokens:
++				var response pluginapi.ExecutorResponse
++				response, err = adapter.CountTokens(context.Background(), pluginapi.ExecutorRequest{HTTPClient: boundClient})
++				body = response.Payload
++			case pluginabi.MethodExecutorHTTPRequest:
++				var response pluginapi.ExecutorHTTPResponse
++				response, err = adapter.HttpRequest(context.Background(), pluginapi.ExecutorHTTPRequest{HTTPClient: boundClient})
++				body = response.Body
++			}
++			if err != nil {
++				t.Fatalf("executor callback error = %v", err)
++			}
++			if got := string(body); got != "bound-client-response" {
++				t.Fatalf("response body = %q, want bound client response", got)
++			}
++			if got := boundClient.doCalls.Load(); got != 1 {
++				t.Fatalf("bound client Do calls = %d, want 1", got)
++			}
++			if got := boundClient.streamCalls.Load(); got != 0 {
++				t.Fatalf("bound client DoStream calls = %d, want 0", got)
++			}
++			if callbackContextExists(host, pluginClient.callbackID) {
++				t.Fatal("executor callback context remained open after call")
++			}
++		})
++	}
++}
++
++func TestRPCExecuteStreamCallbackUsesCallingHTTPClient(t *testing.T) {
++	host := New()
++	boundClient := &callbackRecordingHTTPClient{}
++	pluginClient := &executorHTTPCallbackPluginClient{host: host}
++	adapter := &rpcPluginAdapter{id: "http-stream-callback-plugin", host: host, client: pluginClient}
++
++	response, err := adapter.ExecuteStream(context.Background(), pluginapi.ExecutorRequest{
++		Stream:     true,
++		HTTPClient: boundClient,
++	})
++	if err != nil {
++		t.Fatalf("ExecuteStream() error = %v", err)
++	}
++	var body []byte
++	for chunk := range response.Chunks {
++		if chunk.Err != nil {
++			t.Fatalf("stream chunk error = %v", chunk.Err)
++		}
++		body = append(body, chunk.Payload...)
++	}
++	if got := string(body); got != "bound-client-stream" {
++		t.Fatalf("stream body = %q, want bound client stream", got)
++	}
++	if got := boundClient.streamCalls.Load(); got != 1 {
++		t.Fatalf("bound client DoStream calls = %d, want 1", got)
++	}
++	if got := boundClient.doCalls.Load(); got != 0 {
++		t.Fatalf("bound client Do calls = %d, want 0", got)
++	}
++	if callbackContextExists(host, pluginClient.callbackID) {
++		t.Fatal("stream callback context remained open after inline stream completed")
++	}
++}
++
++func TestHostHTTPCallbackRejectsStaleAndForeignContext(t *testing.T) {
++	host := New()
++	boundClient := &callbackRecordingHTTPClient{}
++	callbackID, closeCallback := host.openCallbackContextForPluginWithHTTPClient(
++		context.Background(), "owner-plugin", boundClient,
++	)
++	rawRequest, err := json.Marshal(rpcHostHTTPRequest{
++		HostCallbackID: callbackID,
++		Method:         http.MethodPost,
++		URL:            callbackHTTPClientTestURL,
++	})
++	if err != nil {
++		t.Fatalf("marshal host HTTP request: %v", err)
++	}
++
++	foreignCtx := withHostCallbackPluginID(context.Background(), "foreign-plugin")
++	if _, err = host.callFromPlugin(foreignCtx, pluginabi.MethodHostHTTPDo, rawRequest); err == nil {
++		t.Fatal("foreign plugin used another plugin's callback context")
++	}
++	if got := boundClient.doCalls.Load(); got != 0 {
++		t.Fatalf("bound client Do calls after foreign callback = %d, want 0", got)
++	}
++
++	closeCallback()
++	ownerCtx := withHostCallbackPluginID(context.Background(), "owner-plugin")
++	if _, err = host.callFromPlugin(ownerCtx, pluginabi.MethodHostHTTPDo, rawRequest); err == nil {
++		t.Fatal("stale callback context fell back to the default HTTP client")
++	}
++	if got := boundClient.doCalls.Load(); got != 0 {
++		t.Fatalf("bound client Do calls after stale callback = %d, want 0", got)
++	}
++}
++
++func TestClosingCallbackContextCancelsInFlightBoundHTTPClient(t *testing.T) {
++	host := New()
++	boundClient := &cancelAwareCallbackHTTPClient{started: make(chan struct{})}
++	callbackID, closeCallback := host.openCallbackContextForPluginWithHTTPClient(
++		context.Background(), "owner-plugin", boundClient,
++	)
++	rawRequest, err := json.Marshal(rpcHostHTTPRequest{
++		HostCallbackID: callbackID,
++		Method:         http.MethodPost,
++		URL:            callbackHTTPClientTestURL,
++	})
++	if err != nil {
++		t.Fatalf("marshal host HTTP request: %v", err)
++	}
++
++	callDone := make(chan error, 1)
++	go func() {
++		_, errCall := host.callFromPlugin(
++			withHostCallbackPluginID(context.Background(), "owner-plugin"),
++			pluginabi.MethodHostHTTPDo,
++			rawRequest,
++		)
++		callDone <- errCall
++	}()
++	select {
++	case <-boundClient.started:
++	case <-time.After(time.Second):
++		t.Fatal("bound HTTP client was not called")
++	}
++	closeCallback()
++	select {
++	case errCall := <-callDone:
++		if errCall == nil {
++			t.Fatal("in-flight callback returned without cancellation error")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("in-flight bound HTTP client was not canceled with its callback context")
++	}
++}
++
++func TestClosingCallbackContextClosesBoundHTTPStream(t *testing.T) {
++	host := New()
++	boundClient := &streamCancelAwareCallbackHTTPClient{canceled: make(chan struct{})}
++	callbackID, closeCallback := host.openCallbackContextForPluginWithHTTPClient(
++		context.Background(), "owner-plugin", boundClient,
++	)
++	rawRequest, err := json.Marshal(rpcHostHTTPRequest{
++		HostCallbackID: callbackID,
++		Method:         http.MethodPost,
++		URL:            callbackHTTPClientTestURL,
++	})
++	if err != nil {
++		t.Fatalf("marshal host HTTP stream request: %v", err)
++	}
++	rawResponse, err := host.callFromPlugin(
++		withHostCallbackPluginID(context.Background(), "owner-plugin"),
++		pluginabi.MethodHostHTTPDoStream,
++		rawRequest,
++	)
++	if err != nil {
++		t.Fatalf("host HTTP stream callback error = %v", err)
++	}
++	response, err := decodeRPCEnvelope[rpcHostHTTPStreamResponse](rawResponse)
++	if err != nil {
++		t.Fatalf("decode host HTTP stream response: %v", err)
++	}
++	if !hostHTTPStreamExists(host, response.StreamID) {
++		t.Fatal("host HTTP stream was not registered")
++	}
++
++	closeCallback()
++	select {
++	case <-boundClient.canceled:
++	case <-time.After(time.Second):
++		t.Fatal("bound HTTP stream context was not canceled")
++	}
++	if hostHTTPStreamExists(host, response.StreamID) {
++		t.Fatal("host HTTP stream remained registered after callback context closed")
++	}
++}
++
++func TestHTTPStreamCleanupRegistrationFailureClosesOpenedStream(t *testing.T) {
++	host := New()
++	boundClient := &callbackClosingStreamHTTPClient{canceled: make(chan struct{})}
++	callbackID, closeCallback := host.openCallbackContextForPluginWithHTTPClient(
++		context.Background(), "owner-plugin", boundClient,
++	)
++	boundClient.closeCallback = closeCallback
++	t.Cleanup(closeCallback)
++
++	rawRequest, err := json.Marshal(rpcHostHTTPRequest{
++		HostCallbackID: callbackID,
++		Method:         http.MethodPost,
++		URL:            callbackHTTPClientTestURL,
++	})
++	if err != nil {
++		t.Fatalf("marshal host HTTP stream request: %v", err)
++	}
++	_, err = host.callFromPlugin(
++		withHostCallbackPluginID(context.Background(), "owner-plugin"),
++		pluginabi.MethodHostHTTPDoStream,
++		rawRequest,
++	)
++	if err == nil || !strings.Contains(err.Error(), "is unavailable") {
++		t.Fatalf("host HTTP stream callback error = %v, want unavailable callback context", err)
++	}
++	if opened := host.httpStreams.next.Load(); opened != 1 {
++		t.Fatalf("host HTTP streams opened = %d, want 1", opened)
++	}
++
++	select {
++	case <-boundClient.canceled:
++	case <-time.After(time.Second):
++		t.Fatal("upstream HTTP stream was not canceled after cleanup registration failed")
++	}
++	host.httpStreams.mu.Lock()
++	streamCount := len(host.httpStreams.streams)
++	host.httpStreams.mu.Unlock()
++	if streamCount != 0 {
++		t.Fatalf("host HTTP streams remaining = %d, want 0", streamCount)
++	}
++}
++
++func TestBoundHTTPStreamRejectsForeignOwner(t *testing.T) {
++	host := New()
++	boundClient := &callbackRecordingHTTPClient{}
++	callbackID, closeCallback := host.openCallbackContextForPluginWithHTTPClient(
++		context.Background(), "owner-plugin", boundClient,
++	)
++	defer closeCallback()
++	rawRequest, err := json.Marshal(rpcHostHTTPRequest{
++		HostCallbackID: callbackID,
++		Method:         http.MethodPost,
++		URL:            callbackHTTPClientTestURL,
++	})
++	if err != nil {
++		t.Fatalf("marshal host HTTP stream request: %v", err)
++	}
++	ownerCtx := withHostCallbackPluginID(context.Background(), "owner-plugin")
++	rawResponse, err := host.callFromPlugin(ownerCtx, pluginabi.MethodHostHTTPDoStream, rawRequest)
++	if err != nil {
++		t.Fatalf("host HTTP stream callback error = %v", err)
++	}
++	response, err := decodeRPCEnvelope[rpcHostHTTPStreamResponse](rawResponse)
++	if err != nil {
++		t.Fatalf("decode host HTTP stream response: %v", err)
++	}
++	rawRead, err := json.Marshal(rpcHostHTTPStreamReadRequest{StreamID: response.StreamID})
++	if err != nil {
++		t.Fatalf("marshal host HTTP stream read: %v", err)
++	}
++	rawClose, err := json.Marshal(rpcHostHTTPStreamCloseRequest{StreamID: response.StreamID})
++	if err != nil {
++		t.Fatalf("marshal host HTTP stream close: %v", err)
++	}
++	foreignCtx := withHostCallbackPluginID(context.Background(), "foreign-plugin")
++	if _, err = host.callFromPlugin(foreignCtx, pluginabi.MethodHostHTTPStreamRead, rawRead); err == nil {
++		t.Fatal("foreign plugin read another plugin's HTTP stream")
++	}
++	if _, err = host.callFromPlugin(foreignCtx, pluginabi.MethodHostHTTPStreamClose, rawClose); err == nil {
++		t.Fatal("foreign plugin closed another plugin's HTTP stream")
++	}
++	if !hostHTTPStreamExists(host, response.StreamID) {
++		t.Fatal("foreign close removed the owning plugin's HTTP stream")
++	}
++	if _, err = host.callFromPlugin(ownerCtx, pluginabi.MethodHostHTTPStreamRead, rawRead); err != nil {
++		t.Fatalf("owner read HTTP stream: %v", err)
++	}
++	if _, err = host.callFromPlugin(ownerCtx, pluginabi.MethodHostHTTPStreamClose, rawClose); err != nil {
++		t.Fatalf("owner close HTTP stream: %v", err)
++	}
++	if hostHTTPStreamExists(host, response.StreamID) {
++		t.Fatal("HTTP stream remained open after owner closed it")
++	}
++}
++
++type callbackRecordingHTTPClient struct {
++	doCalls     atomic.Int32
++	streamCalls atomic.Int32
++}
++
++type cancelAwareCallbackHTTPClient struct {
++	started chan struct{}
++}
++
++func (c *cancelAwareCallbackHTTPClient) Do(ctx context.Context, _ pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
++	close(c.started)
++	<-ctx.Done()
++	return pluginapi.HTTPResponse{}, ctx.Err()
++}
++
++func (c *cancelAwareCallbackHTTPClient) DoStream(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPStreamResponse, error) {
++	return pluginapi.HTTPStreamResponse{}, fmt.Errorf("unexpected DoStream call")
++}
++
++type streamCancelAwareCallbackHTTPClient struct {
++	canceled chan struct{}
++}
++
++type callbackClosingStreamHTTPClient struct {
++	closeCallback func()
++	canceled      chan struct{}
++}
++
++func (c *streamCancelAwareCallbackHTTPClient) Do(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
++	return pluginapi.HTTPResponse{}, fmt.Errorf("unexpected Do call")
++}
++
++func (c *streamCancelAwareCallbackHTTPClient) DoStream(ctx context.Context, _ pluginapi.HTTPRequest) (pluginapi.HTTPStreamResponse, error) {
++	chunks := make(chan pluginapi.HTTPStreamChunk)
++	go func() {
++		<-ctx.Done()
++		close(c.canceled)
++		close(chunks)
++	}()
++	return pluginapi.HTTPStreamResponse{StatusCode: http.StatusOK, Chunks: chunks}, nil
++}
++
++func (c *callbackClosingStreamHTTPClient) Do(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
++	return pluginapi.HTTPResponse{}, fmt.Errorf("unexpected Do call")
++}
++
++func (c *callbackClosingStreamHTTPClient) DoStream(ctx context.Context, _ pluginapi.HTTPRequest) (pluginapi.HTTPStreamResponse, error) {
++	c.closeCallback()
++	chunks := make(chan pluginapi.HTTPStreamChunk)
++	go func() {
++		<-ctx.Done()
++		close(c.canceled)
++		close(chunks)
++	}()
++	return pluginapi.HTTPStreamResponse{StatusCode: http.StatusOK, Chunks: chunks}, nil
++}
++
++func hostHTTPStreamExists(host *Host, streamID string) bool {
++	if host == nil || host.httpStreams == nil {
++		return false
++	}
++	host.httpStreams.mu.Lock()
++	_, exists := host.httpStreams.streams[streamID]
++	host.httpStreams.mu.Unlock()
++	return exists
++}
++
++func (c *callbackRecordingHTTPClient) Do(_ context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
++	if req.URL != callbackHTTPClientTestURL {
++		return pluginapi.HTTPResponse{}, fmt.Errorf("request URL = %q, want %q", req.URL, callbackHTTPClientTestURL)
++	}
++	c.doCalls.Add(1)
++	return pluginapi.HTTPResponse{
++		StatusCode: http.StatusCreated,
++		Headers:    http.Header{"X-Callback-Client": []string{"bound"}},
++		Body:       []byte("bound-client-response"),
++	}, nil
++}
++
++func (c *callbackRecordingHTTPClient) DoStream(_ context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPStreamResponse, error) {
++	if req.URL != callbackHTTPClientTestURL {
++		return pluginapi.HTTPStreamResponse{}, fmt.Errorf("request URL = %q, want %q", req.URL, callbackHTTPClientTestURL)
++	}
++	c.streamCalls.Add(1)
++	chunks := make(chan pluginapi.HTTPStreamChunk, 1)
++	chunks <- pluginapi.HTTPStreamChunk{Payload: []byte("bound-client-stream")}
++	close(chunks)
++	return pluginapi.HTTPStreamResponse{
++		StatusCode: http.StatusPartialContent,
++		Headers:    http.Header{"X-Callback-Client": []string{"bound-stream"}},
++		Chunks:     chunks,
++	}, nil
++}
++
++type executorHTTPCallbackPluginClient struct {
++	host       *Host
++	callbackID string
++}
++
++func (c *executorHTTPCallbackPluginClient) Call(ctx context.Context, method string, request []byte) ([]byte, error) {
++	switch method {
++	case pluginabi.MethodExecutorExecute, pluginabi.MethodExecutorCountTokens:
++		var req rpcExecutorRequest
++		if err := json.Unmarshal(request, &req); err != nil {
++			return nil, fmt.Errorf("decode executor request: %w", err)
++		}
++		c.callbackID = req.HostCallbackID
++		response, err := c.callHostHTTPDo(ctx, req.HostCallbackID)
++		if err != nil {
++			return nil, err
++		}
++		return marshalRPCResult(pluginapi.ExecutorResponse{Payload: response.Body, Headers: response.Headers})
++	case pluginabi.MethodExecutorHTTPRequest:
++		var req rpcExecutorHTTPRequest
++		if err := json.Unmarshal(request, &req); err != nil {
++			return nil, fmt.Errorf("decode executor HTTP request: %w", err)
++		}
++		c.callbackID = req.HostCallbackID
++		response, err := c.callHostHTTPDo(ctx, req.HostCallbackID)
++		if err != nil {
++			return nil, err
++		}
++		return marshalRPCResult(pluginapi.ExecutorHTTPResponse{
++			StatusCode: response.StatusCode,
++			Headers:    response.Headers,
++			Body:       response.Body,
++		})
++	case pluginabi.MethodExecutorExecuteStream:
++		var req rpcExecutorRequest
++		if err := json.Unmarshal(request, &req); err != nil {
++			return nil, fmt.Errorf("decode executor stream request: %w", err)
++		}
++		c.callbackID = req.HostCallbackID
++		chunk, headers, err := c.callHostHTTPDoStream(ctx, req.HostCallbackID)
++		if err != nil {
++			return nil, err
++		}
++		return marshalRPCResult(rpcExecutorStreamResponse{
++			Headers: headers,
++			Chunks:  []pluginapi.ExecutorStreamChunk{{Payload: chunk.Payload, Err: chunk.Err}},
++		})
++	default:
++		return nil, fmt.Errorf("unexpected plugin method %q", method)
++	}
++}
++
++func (c *executorHTTPCallbackPluginClient) Shutdown() {}
++
++func (c *executorHTTPCallbackPluginClient) callHostHTTPDo(ctx context.Context, callbackID string) (pluginapi.HTTPResponse, error) {
++	rawRequest, err := json.Marshal(rpcHostHTTPRequest{
++		HostCallbackID: callbackID,
++		Method:         http.MethodPost,
++		URL:            callbackHTTPClientTestURL,
++	})
++	if err != nil {
++		return pluginapi.HTTPResponse{}, err
++	}
++	callbackCtx := withHostCallbackPluginID(ctx, c.host.callbackContextPluginID(callbackID))
++	rawResponse, err := c.host.callFromPlugin(callbackCtx, pluginabi.MethodHostHTTPDo, rawRequest)
++	if err != nil {
++		return pluginapi.HTTPResponse{}, err
++	}
++	return decodeRPCEnvelope[pluginapi.HTTPResponse](rawResponse)
++}
++
++func (c *executorHTTPCallbackPluginClient) callHostHTTPDoStream(ctx context.Context, callbackID string) (pluginapi.HTTPStreamChunk, http.Header, error) {
++	rawRequest, err := json.Marshal(rpcHostHTTPRequest{
++		HostCallbackID: callbackID,
++		Method:         http.MethodPost,
++		URL:            callbackHTTPClientTestURL,
++	})
++	if err != nil {
++		return pluginapi.HTTPStreamChunk{}, nil, err
++	}
++	callbackCtx := withHostCallbackPluginID(ctx, c.host.callbackContextPluginID(callbackID))
++	rawResponse, err := c.host.callFromPlugin(callbackCtx, pluginabi.MethodHostHTTPDoStream, rawRequest)
++	if err != nil {
++		return pluginapi.HTTPStreamChunk{}, nil, err
++	}
++	response, err := decodeRPCEnvelope[rpcHostHTTPStreamResponse](rawResponse)
++	if err != nil {
++		return pluginapi.HTTPStreamChunk{}, nil, err
++	}
++	defer func() {
++		rawClose, _ := json.Marshal(rpcHostHTTPStreamCloseRequest{StreamID: response.StreamID})
++		_, _ = c.host.callFromPlugin(callbackCtx, pluginabi.MethodHostHTTPStreamClose, rawClose)
++	}()
++	rawRead, err := json.Marshal(rpcHostHTTPStreamReadRequest{StreamID: response.StreamID})
++	if err != nil {
++		return pluginapi.HTTPStreamChunk{}, nil, err
++	}
++	rawChunk, err := c.host.callFromPlugin(callbackCtx, pluginabi.MethodHostHTTPStreamRead, rawRead)
++	if err != nil {
++		return pluginapi.HTTPStreamChunk{}, nil, err
++	}
++	chunk, err := decodeRPCEnvelope[rpcHostHTTPStreamReadResponse](rawChunk)
++	if err != nil {
++		return pluginapi.HTTPStreamChunk{}, nil, err
++	}
++	if chunk.Done && len(chunk.Payload) == 0 {
++		return pluginapi.HTTPStreamChunk{}, nil, fmt.Errorf("host HTTP stream ended before yielding a chunk")
++	}
++	var chunkErr error
++	if chunk.Error != "" {
++		chunkErr = fmt.Errorf("%s", chunk.Error)
++	}
++	return pluginapi.HTTPStreamChunk{Payload: chunk.Payload, Err: chunkErr}, http.Header(response.Headers), nil
++}
+diff --git a/internal/pluginhost/rpc_client_stream.go b/internal/pluginhost/rpc_client_stream.go
+index 8793914..66e0fae 100644
+--- a/internal/pluginhost/rpc_client_stream.go
++++ b/internal/pluginhost/rpc_client_stream.go
+@@ -13,9 +13,13 @@ func (a *rpcPluginAdapter) ExecuteStream(ctx context.Context, req pluginapi.Exec
+ 	if a == nil || a.host == nil || a.host.streams == nil {
+ 		return pluginapi.ExecutorStreamResponse{}, fmt.Errorf("plugin stream bridge is unavailable")
+ 	}
++	releaseLease, errLease := acquirePluginClientLease(a.client)
++	if errLease != nil {
++		return pluginapi.ExecutorStreamResponse{}, errLease
++	}
+ 	streamID, chunks, cleanupStream := a.host.streams.open(ctx)
+-	callbackID, closeCallback := a.openHostCallbackContext(ctx)
+-	cleanup := combinedCleanup(cleanupStream, closeCallback)
++	callbackID, closeCallback := a.openHostCallbackContextWithHTTPClient(ctx, req.HTTPClient)
++	cleanup := combinedCleanup(cleanupStream, closeCallback, releaseLease)
+ 	rpcReq := rpcExecutorRequest{
+ 		ExecutorRequest: req,
+ 		StreamID:        streamID,
+diff --git a/internal/pluginhost/rpc_client_stream_test.go b/internal/pluginhost/rpc_client_stream_test.go
+index 6e293a2..d4d2ed3 100644
+--- a/internal/pluginhost/rpc_client_stream_test.go
++++ b/internal/pluginhost/rpc_client_stream_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"net/http"
++	"sync/atomic"
+ 	"testing"
+ 	"time"
+ 
+@@ -79,6 +80,108 @@ func TestRPCExecuteStreamClosesHostCallbackScopeOnContextCancelWhileChunkPending
+ 	}
+ }
+ 
++func TestRPCExecuteStreamLeaseDelaysGuardedClientShutdownUntilStreamCloses(t *testing.T) {
++	host := New()
++	inner := newStreamCallbackPluginClient()
++	guarded := newGuardedPluginClient(inner)
++	adapter := &rpcPluginAdapter{
++		id:     "leased-stream-plugin",
++		host:   host,
++		client: guarded,
++	}
++
++	stream, errStream := adapter.ExecuteStream(context.Background(), pluginapi.ExecutorRequest{Stream: true})
++	if errStream != nil {
++		t.Fatalf("ExecuteStream() error = %v", errStream)
++	}
++	waitForStreamCallbackPlugin(t, inner)
++
++	shutdownDone := make(chan struct{})
++	go func() {
++		guarded.Shutdown()
++		close(shutdownDone)
++	}()
++	select {
++	case <-shutdownDone:
++		t.Fatal("guarded client shut down before the asynchronous stream closed")
++	case <-time.After(50 * time.Millisecond):
++	}
++	if got := inner.shutdown.Load(); got != 0 {
++		t.Fatalf("inner shutdown calls before stream close = %d, want 0", got)
++	}
++
++	closeReq, errMarshal := json.Marshal(rpcStreamCloseRequest{StreamID: inner.streamID})
++	if errMarshal != nil {
++		t.Fatalf("marshal close request: %v", errMarshal)
++	}
++	if _, errClose := host.callFromPlugin(context.Background(), pluginabi.MethodHostStreamClose, closeReq); errClose != nil {
++		t.Fatalf("close stream: %v", errClose)
++	}
++	for range stream.Chunks {
++	}
++	select {
++	case <-shutdownDone:
++	case <-time.After(time.Second):
++		t.Fatal("guarded client did not shut down after the asynchronous stream closed")
++	}
++	if got := inner.shutdown.Load(); got != 1 {
++		t.Fatalf("inner shutdown calls after stream close = %d, want 1", got)
++	}
++}
++
++func TestRPCExecuteStreamLeaseReleasesForInlineStream(t *testing.T) {
++	host := New()
++	inner := newStreamCallbackPluginClient()
++	inner.inlineChunks = []pluginapi.ExecutorStreamChunk{{Payload: []byte("inline")}}
++	guarded := newGuardedPluginClient(inner)
++	adapter := &rpcPluginAdapter{id: "inline-stream-plugin", host: host, client: guarded}
++
++	stream, errStream := adapter.ExecuteStream(context.Background(), pluginapi.ExecutorRequest{Stream: true})
++	if errStream != nil {
++		t.Fatalf("ExecuteStream() error = %v", errStream)
++	}
++	var payload []byte
++	for chunk := range stream.Chunks {
++		payload = append(payload, chunk.Payload...)
++	}
++	if got := string(payload); got != "inline" {
++		t.Fatalf("inline payload = %q, want inline", got)
++	}
++	shutdownGuardedWithin(t, guarded)
++	if got := inner.shutdown.Load(); got != 1 {
++		t.Fatalf("inline stream shutdown calls = %d, want 1", got)
++	}
++}
++
++func TestRPCExecuteStreamLeaseReleasesOnPluginError(t *testing.T) {
++	host := New()
++	inner := &failingStreamPluginClient{}
++	guarded := newGuardedPluginClient(inner)
++	adapter := &rpcPluginAdapter{id: "failing-stream-plugin", host: host, client: guarded}
++
++	if _, errStream := adapter.ExecuteStream(context.Background(), pluginapi.ExecutorRequest{Stream: true}); errStream == nil {
++		t.Fatal("ExecuteStream() error = nil, want plugin failure")
++	}
++	shutdownGuardedWithin(t, guarded)
++	if got := inner.shutdown.Load(); got != 1 {
++		t.Fatalf("failed stream shutdown calls = %d, want 1", got)
++	}
++}
++
++func shutdownGuardedWithin(t *testing.T, guarded *guardedPluginClient) {
++	t.Helper()
++	done := make(chan struct{})
++	go func() {
++		guarded.Shutdown()
++		close(done)
++	}()
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("guarded client shutdown remained blocked after stream cleanup")
++	}
++}
++
+ func callbackContextExists(host *Host, callbackID string) bool {
+ 	if host == nil || host.callbackContexts == nil {
+ 		return false
+@@ -90,9 +193,11 @@ func callbackContextExists(host *Host, callbackID string) bool {
+ }
+ 
+ type streamCallbackPluginClient struct {
+-	called     chan struct{}
+-	streamID   string
+-	callbackID string
++	called       chan struct{}
++	streamID     string
++	callbackID   string
++	inlineChunks []pluginapi.ExecutorStreamChunk
++	shutdown     atomic.Int32
+ }
+ 
+ func newStreamCallbackPluginClient() *streamCallbackPluginClient {
+@@ -112,10 +217,25 @@ func (c *streamCallbackPluginClient) Call(ctx context.Context, method string, re
+ 	close(c.called)
+ 	return marshalRPCResult(rpcExecutorStreamResponse{
+ 		Headers: http.Header{"Content-Type": []string{"text/event-stream"}},
++		Chunks:  append([]pluginapi.ExecutorStreamChunk(nil), c.inlineChunks...),
+ 	})
+ }
+ 
+-func (c *streamCallbackPluginClient) Shutdown() {}
++func (c *streamCallbackPluginClient) Shutdown() {
++	c.shutdown.Add(1)
++}
++
++type failingStreamPluginClient struct {
++	shutdown atomic.Int32
++}
++
++func (c *failingStreamPluginClient) Call(context.Context, string, []byte) ([]byte, error) {
++	return nil, fmt.Errorf("stream plugin failed")
++}
++
++func (c *failingStreamPluginClient) Shutdown() {
++	c.shutdown.Add(1)
++}
+ 
+ func waitForStreamCallbackPlugin(t *testing.T, client *streamCallbackPluginClient) {
+ 	t.Helper()
+diff --git a/internal/thinking/apply.go b/internal/thinking/apply.go
+index 8a6f873..38b7702 100644
+--- a/internal/thinking/apply.go
++++ b/internal/thinking/apply.go
+@@ -162,17 +162,33 @@ func IsUserDefinedModel(modelInfo *registry.ModelInfo) bool {
+ //	// Without suffix - uses body config
+ //	result, err := thinking.ApplyThinking(body, "gemini-2.5-pro", "gemini", "gemini", "gemini")
+ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string, providerKey string) ([]byte, error) {
++	return applyThinking(body, model, fromFormat, toFormat, providerKey, toFormat)
++}
++
++// ApplyThinkingWithApplier applies canonical thinking parsing and validation
++// while selecting an applier independently from the native payload format.
++// Plugin executors use this when their provider identifier differs from the
++// wire protocol they accept.
++func ApplyThinkingWithApplier(body []byte, model string, fromFormat string, toFormat string, providerKey string, applierKey string) ([]byte, error) {
++	return applyThinking(body, model, fromFormat, toFormat, providerKey, applierKey)
++}
++
++func applyThinking(body []byte, model string, fromFormat string, toFormat string, providerKey string, applierKey string) ([]byte, error) {
+ 	providerFormat := strings.ToLower(strings.TrimSpace(toFormat))
+ 	providerKey = strings.ToLower(strings.TrimSpace(providerKey))
+ 	if providerKey == "" {
+ 		providerKey = providerFormat
+ 	}
++	applierKey = strings.ToLower(strings.TrimSpace(applierKey))
++	if applierKey == "" {
++		applierKey = providerFormat
++	}
+ 	fromFormat = strings.ToLower(strings.TrimSpace(fromFormat))
+ 	if fromFormat == "" {
+ 		fromFormat = providerFormat
+ 	}
+ 	// 1. Route check: Get provider applier
+-	applier := GetProviderApplier(providerFormat)
++	applier := GetProviderApplier(applierKey)
+ 	if applier == nil {
+ 		log.WithFields(log.Fields{
+ 			"provider": providerFormat,
+@@ -191,7 +207,7 @@ func ApplyThinking(body []byte, model string, fromFormat string, toFormat string
+ 	// Unknown models are treated as user-defined so thinking config can still be applied.
+ 	// The upstream service is responsible for validating the configuration.
+ 	if IsUserDefinedModel(modelInfo) {
+-		return applyUserDefinedModel(body, modelInfo, fromFormat, providerFormat, suffixResult)
++		return applyUserDefinedModel(body, modelInfo, fromFormat, providerFormat, suffixResult, applier)
+ 	}
+ 	if modelInfo.Thinking == nil {
+ 		config := extractThinkingConfig(body, providerFormat)
+@@ -319,7 +335,7 @@ func parseSuffixToConfig(rawSuffix, provider, model string) ThinkingConfig {
+ 
+ // applyUserDefinedModel applies thinking configuration for user-defined models
+ // without ThinkingSupport validation.
+-func applyUserDefinedModel(body []byte, modelInfo *registry.ModelInfo, fromFormat, toFormat string, suffixResult SuffixResult) ([]byte, error) {
++func applyUserDefinedModel(body []byte, modelInfo *registry.ModelInfo, fromFormat, toFormat string, suffixResult SuffixResult, applier ProviderApplier) ([]byte, error) {
+ 	// Get model ID for logging
+ 	modelID := ""
+ 	if modelInfo != nil {
+@@ -363,15 +379,6 @@ func applyUserDefinedModel(body []byte, modelInfo *registry.ModelInfo, fromForma
+ 		return body, nil
+ 	}
+ 
+-	applier := GetProviderApplier(toFormat)
+-	if applier == nil {
+-		log.WithFields(log.Fields{
+-			"model":    modelID,
+-			"provider": toFormat,
+-		}).Debug("thinking: user-defined model, passthrough (unknown provider) |")
+-		return body, nil
+-	}
+-
+ 	config = normalizeUserDefinedConfig(config, fromFormat, toFormat)
+ 	log.WithFields(log.Fields{
+ 		"provider": toFormat,
+@@ -418,7 +425,7 @@ func extractThinkingConfig(body []byte, provider string) ThinkingConfig {
+ 		return extractInteractionsConfig(body)
+ 	case "openai":
+ 		return extractOpenAIConfig(body)
+-	case "codex", "xai":
++	case "codex", "openai-response", "xai":
+ 		return extractCodexConfig(body)
+ 	case "kimi":
+ 		return extractKimiConfig(body)
+diff --git a/internal/thinking/apply_plugin_test.go b/internal/thinking/apply_plugin_test.go
+new file mode 100644
+index 0000000..4ddf5d7
+--- /dev/null
++++ b/internal/thinking/apply_plugin_test.go
+@@ -0,0 +1,116 @@
++package thinking
++
++import (
++	"encoding/json"
++	"testing"
++
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
++)
++
++type capturePluginApplier struct {
++	config ThinkingConfig
++}
++
++func (a *capturePluginApplier) Apply(body []byte, config ThinkingConfig, _ *registry.ModelInfo) ([]byte, error) {
++	a.config = config
++	var payload map[string]any
++	if err := json.Unmarshal(body, &payload); err != nil {
++		return nil, err
++	}
++	payload["plugin_applied"] = true
++	return json.Marshal(payload)
++}
++
++func TestApplyThinkingWithApplierSeparatesWireFormatFromPluginProvider(t *testing.T) {
++	ClearPluginProviders()
++	t.Cleanup(ClearPluginProviders)
++	applier := &capturePluginApplier{}
++	if !RegisterPluginProvider("test-owner", "plugin-provider", 0, applier) {
++		t.Fatal("RegisterPluginProvider() = false")
++	}
++
++	out, err := ApplyThinkingWithApplier(
++		[]byte(`{"reasoning":{"effort":"high"}}`),
++		"custom-model",
++		"openai-response",
++		"openai-response",
++		"plugin-provider",
++		"plugin-provider",
++	)
++	if err != nil {
++		t.Fatalf("ApplyThinkingWithApplier() error = %v", err)
++	}
++	if applier.config.Mode != ModeLevel || applier.config.Level != LevelHigh {
++		t.Fatalf("captured config = %#v, want level/high", applier.config)
++	}
++	var payload map[string]any
++	if err = json.Unmarshal(out, &payload); err != nil || payload["plugin_applied"] != true {
++		t.Fatalf("output = %s, error = %v", out, err)
++	}
++}
++
++func TestApplyThinkingWithApplierValidatesConfiguredPluginModels(t *testing.T) {
++	ClearPluginProviders()
++	t.Cleanup(ClearPluginProviders)
++	applier := &capturePluginApplier{}
++	if !RegisterPluginProvider("test-owner", "plugin-provider", 0, applier) {
++		t.Fatal("RegisterPluginProvider() = false")
++	}
++
++	const clientID = "plugin-thinking-validation-test"
++	modelRegistry := registry.GetGlobalRegistry()
++	modelRegistry.RegisterClient(clientID, "plugin-provider", []*registry.ModelInfo{
++		{
++			ID:          "validated-levels",
++			Type:        "multi-protocol-provider",
++			UserDefined: false,
++			Thinking: &registry.ThinkingSupport{
++				Levels: []string{"low", "medium", "high"},
++			},
++		},
++		{
++			ID:          "validated-budget",
++			Type:        "multi-protocol-provider",
++			UserDefined: false,
++			Thinking: &registry.ThinkingSupport{
++				Min: 1024,
++				Max: 8192,
++			},
++		},
++	})
++	t.Cleanup(func() { modelRegistry.UnregisterClient(clientID) })
++
++	tests := []struct {
++		name       string
++		model      string
++		format     string
++		wantMode   ThinkingMode
++		wantBudget int
++		wantLevel  ThinkingLevel
++	}{
++		{name: "level maximum", model: "validated-levels(99999)", format: "openai", wantMode: ModeLevel, wantLevel: LevelHigh},
++		{name: "level cannot disable", model: "validated-levels(none)", format: "openai", wantMode: ModeNone, wantLevel: LevelLow},
++		{name: "level auto midpoint", model: "validated-levels(auto)", format: "openai", wantMode: ModeLevel, wantLevel: LevelMedium},
++		{name: "budget maximum", model: "validated-budget(99999)", format: "gemini", wantMode: ModeBudget, wantBudget: 8192},
++		{name: "budget cannot disable", model: "validated-budget(0)", format: "gemini", wantMode: ModeNone, wantBudget: 1024},
++		{name: "budget auto midpoint", model: "validated-budget(auto)", format: "gemini", wantMode: ModeBudget, wantBudget: 4608},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			_, err := ApplyThinkingWithApplier(
++				[]byte(`{}`),
++				tt.model,
++				tt.format,
++				tt.format,
++				"plugin-provider",
++				"plugin-provider",
++			)
++			if err != nil {
++				t.Fatalf("ApplyThinkingWithApplier() error = %v", err)
++			}
++			if applier.config.Mode != tt.wantMode || applier.config.Budget != tt.wantBudget || applier.config.Level != tt.wantLevel {
++				t.Fatalf("captured config = %#v, want mode=%s budget=%d level=%s", applier.config, tt.wantMode, tt.wantBudget, tt.wantLevel)
++			}
++		})
++	}
++}
+diff --git a/sdk/cliproxy/auth/types.go b/sdk/cliproxy/auth/types.go
+index 88f6c04..3d1748c 100644
+--- a/sdk/cliproxy/auth/types.go
++++ b/sdk/cliproxy/auth/types.go
+@@ -131,7 +131,6 @@ func MarkPluginVirtualAuth(auth *Auth, sourcePath string, ordinal int) {
+ 		strings.ToLower(strings.TrimSpace(auth.Provider)),
+ 		sourcePath,
+ 		seedID,
+-		strconv.Itoa(ordinal),
+ 	}, "|")
+ }
+ 
+diff --git a/sdk/cliproxy/auth/types_test.go b/sdk/cliproxy/auth/types_test.go
+index 83f3392..1631795 100644
+--- a/sdk/cliproxy/auth/types_test.go
++++ b/sdk/cliproxy/auth/types_test.go
+@@ -103,6 +103,22 @@ func TestEnsureIndexUsesCredentialIdentity(t *testing.T) {
+ 	}
+ }
+ 
++func TestPluginVirtualAuthIndexUsesStableCredentialID(t *testing.T) {
++	first := &Auth{ID: "pool.json#primary", Provider: "plugin-provider"}
++	reordered := &Auth{ID: "pool.json#primary", Provider: "plugin-provider"}
++	other := &Auth{ID: "pool.json#secondary", Provider: "plugin-provider"}
++	MarkPluginVirtualAuth(first, "/auth/pool.json", 0)
++	MarkPluginVirtualAuth(reordered, "/auth/pool.json", 7)
++	MarkPluginVirtualAuth(other, "/auth/pool.json", 0)
++
++	if first.EnsureIndex() != reordered.EnsureIndex() {
++		t.Fatalf("same virtual credential changed index after reorder: %q != %q", first.Index, reordered.Index)
++	}
++	if first.Index == other.EnsureIndex() {
++		t.Fatalf("different virtual credentials share index %q", first.Index)
++	}
++}
++
+ func TestEnsureIndexUsesOAuthTypeAndAbsolutePath(t *testing.T) {
+ 	t.Parallel()
+ 

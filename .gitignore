@@ -1,0 +1,12 @@
+/bin/
+/dist/
+*.so
+*.dylib
+*.dll
+*.h
+*.test
+coverage.out
+.env
+.env.*
+!.env.example
+multi-protocol-provider.json

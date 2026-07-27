@@ -1,0 +1,640 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>通用提供商</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f5f6f7;
+      --surface: #ffffff;
+      --surface-2: #f0f2f3;
+      --text: #171a1d;
+      --muted: #626970;
+      --line: #d8dcdf;
+      --accent: #176b4d;
+      --accent-strong: #0f573d;
+      --accent-soft: #e3f2eb;
+      --danger: #b3261e;
+      --danger-soft: #fce8e6;
+      --warn: #8a5600;
+      --shadow: 0 8px 30px rgba(23, 26, 29, .12);
+      --radius: 6px;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+      letter-spacing: 0;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #17191b;
+        --surface: #212427;
+        --surface-2: #292d30;
+        --text: #f1f3f4;
+        --muted: #adb3b8;
+        --line: #3b4145;
+        --accent: #58b98d;
+        --accent-strong: #79c9a5;
+        --accent-soft: #193c2e;
+        --danger: #ff8a80;
+        --danger-soft: #4a2220;
+        --warn: #f0b95d;
+        --shadow: 0 10px 36px rgba(0, 0, 0, .35);
+      }
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--text); }
+    body { min-width: 280px; }
+    button, input, select { font: inherit; letter-spacing: 0; }
+    button { cursor: pointer; }
+    button:disabled { cursor: not-allowed; opacity: .55; }
+    .shell { width: min(1180px, 100%); margin: 0 auto; padding: 22px 26px 56px; }
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 46px; margin-bottom: 22px; }
+    .brand { min-width: 0; display: flex; align-items: center; gap: 11px; }
+    .brand-mark { width: 34px; height: 34px; display: grid; place-items: center; color: #fff; background: var(--accent); border-radius: 6px; font-weight: 750; font-size: 13px; }
+    h1 { margin: 0; font-size: 20px; line-height: 1.25; font-weight: 700; }
+    .subtitle { margin-top: 2px; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .actions { display: flex; align-items: center; gap: 8px; flex: none; }
+    .btn { min-height: 36px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); color: var(--text); padding: 7px 13px; font-weight: 620; }
+    .btn:hover { border-color: var(--accent); }
+    .btn.primary { border-color: var(--accent); color: #fff; background: var(--accent); }
+    .btn.primary:hover { background: var(--accent-strong); }
+    .btn.danger { color: var(--danger); }
+    .btn.icon { width: 36px; padding: 0; font-size: 20px; line-height: 1; }
+    .btn.small { min-height: 30px; padding: 4px 10px; font-size: 12px; }
+    .status { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--line); }
+    .dot.ready { background: var(--accent); }
+    .section { padding: 22px 0 26px; border-top: 1px solid var(--line); }
+    .section:first-of-type { border-top: 0; padding-top: 4px; }
+    .section-head { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 16px; }
+    .section-title { margin: 0; font-size: 15px; line-height: 1.3; font-weight: 700; }
+    .count { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+    .grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 14px 16px; }
+    .field { grid-column: span 4; min-width: 0; }
+    .field.wide { grid-column: span 8; }
+    .field.full { grid-column: 1 / -1; }
+    .field.half { grid-column: span 6; }
+    label, .label { display: block; margin: 0 0 6px; color: var(--muted); font-size: 12px; font-weight: 620; }
+    input, select { width: 100%; min-height: 38px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); color: var(--text); padding: 8px 10px; outline: 0; }
+    input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 18%, transparent); }
+    input::placeholder { color: color-mix(in srgb, var(--muted) 72%, transparent); }
+    .protocols { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+    .protocols label { margin: 0; min-width: 0; }
+    .protocols input { position: absolute; width: 1px; min-height: 0; height: 1px; margin: 0; padding: 0; opacity: 0; pointer-events: none; }
+    .protocols span { min-height: 42px; display: grid; place-items: center; padding: 8px 10px; border-left: 1px solid var(--line); background: var(--surface); color: var(--muted); text-align: center; font-size: 12px; font-weight: 650; }
+    .protocols label:first-child span { border-left: 0; }
+    .protocols input:checked + span { background: var(--accent-soft); color: var(--accent-strong); box-shadow: inset 0 -2px 0 var(--accent); }
+    .protocols input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: -2px; }
+    .toggles { display: flex; flex-wrap: wrap; gap: 18px; min-height: 38px; align-items: center; }
+    .toggle { display: inline-flex; align-items: center; gap: 8px; margin: 0; color: var(--text); font-size: 13px; cursor: pointer; }
+    .toggle input { width: 36px; min-height: 20px; height: 20px; padding: 0; appearance: none; border-radius: 10px; background: var(--line); position: relative; }
+    .toggle input::after { content: ""; position: absolute; width: 14px; height: 14px; left: 2px; top: 2px; border-radius: 50%; background: #fff; transition: transform .15s ease; box-shadow: 0 1px 2px rgba(0,0,0,.25); }
+    .toggle input:checked { background: var(--accent); }
+    .toggle input:checked::after { transform: translateX(16px); }
+    .rows { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+    .row { display: grid; grid-template-columns: minmax(140px, .8fr) minmax(220px, 1.4fr) 36px; gap: 10px; align-items: end; }
+    .item { min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); padding: 15px; }
+    .item-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 13px; }
+    .item-name { min-width: 0; font-weight: 690; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .item-actions { display: flex; gap: 6px; flex: none; }
+    .key-grid { display: grid; grid-template-columns: 1fr 1.5fr 1fr 120px; gap: 12px; }
+    .key-grid > .field, .model-main > .field, .model-detail > .field { grid-column: auto; }
+    .secret-wrap { display: flex; gap: 6px; }
+    .secret-wrap input { min-width: 0; }
+    .secret-wrap button { flex: none; }
+    .model-main { display: grid; grid-template-columns: 1.2fr 1fr 1fr; gap: 12px; }
+    .model-detail { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; padding-top: 13px; margin-top: 13px; border-top: 1px solid var(--line); }
+    .model-detail[hidden] { display: none; }
+    .model-detail .span-2 { grid-column: span 2; }
+    .model-detail .span-4 { grid-column: 1 / -1; }
+    .empty { padding: 28px 16px; border: 1px dashed var(--line); border-radius: var(--radius); color: var(--muted); text-align: center; }
+    .auth-modal { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 20px; background: rgba(10, 12, 14, .56); }
+    .auth-modal[hidden] { display: none; }
+    .dialog { width: min(420px, 100%); border: 1px solid var(--line); border-radius: 8px; background: var(--surface); box-shadow: var(--shadow); padding: 22px; }
+    .dialog h2 { margin: 0 0 18px; font-size: 17px; }
+    .dialog-actions { display: flex; justify-content: flex-end; margin-top: 14px; }
+    .notice { position: fixed; right: 20px; bottom: 20px; z-index: 70; width: min(360px, calc(100% - 40px)); padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
+    .notice[hidden] { display: none; }
+    .notice.error { border-color: var(--danger); color: var(--danger); }
+    .notice.success { border-color: var(--accent); color: var(--accent-strong); }
+    .testbar { display: grid; grid-template-columns: minmax(150px, 1fr) minmax(160px, 1fr) auto; gap: 10px; align-items: end; }
+    .test-result { min-height: 20px; margin-top: 10px; color: var(--muted); font-size: 12px; }
+    .test-result.ok { color: var(--accent-strong); }
+    .test-result.fail { color: var(--danger); }
+    .loading { opacity: .62; pointer-events: none; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+    @media (max-width: 820px) {
+      .shell { padding: 18px 18px 48px; }
+      .field, .field.wide { grid-column: span 6; }
+      .field.full { grid-column: 1 / -1; }
+      .key-grid { grid-template-columns: 1fr 1fr; }
+      .model-detail { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .model-detail .span-4 { grid-column: 1 / -1; }
+      .model-main { grid-template-columns: 1fr 1fr; }
+      .model-main .field:last-child { grid-column: 1 / -1; }
+    }
+    @media (max-width: 560px) {
+      .shell { padding: 14px 12px 40px; }
+      .topbar { align-items: flex-start; }
+      .subtitle, .status { display: none; }
+      .actions .btn:not(.primary) { padding-inline: 9px; }
+      .protocols { grid-template-columns: 1fr 1fr; }
+      .protocols label:nth-child(3) span { border-left: 0; border-top: 1px solid var(--line); }
+      .protocols label:nth-child(4) span { border-top: 1px solid var(--line); }
+      .field, .field.wide, .field.half { grid-column: 1 / -1; }
+      .key-grid, .model-main, .model-detail, .testbar { grid-template-columns: 1fr; }
+      .model-detail .span-2, .model-detail .span-4 { grid-column: 1; }
+      .row { grid-template-columns: 1fr 1fr 36px; }
+      .section { padding-block: 19px 22px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell" id="app" aria-busy="true">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">MP</div>
+        <div><h1 id="page-title">通用提供商</h1><div class="subtitle">Multi-protocol Provider</div></div>
+      </div>
+      <div class="actions">
+        <span class="status"><span class="dot" id="status-dot"></span><span id="status-text">未连接</span></span>
+        <button class="btn" id="auth-button" type="button">管理密钥</button>
+        <button class="btn primary" id="save-button" type="button">保存</button>
+      </div>
+    </header>
+
+    <form id="provider-form" autocomplete="off">
+      <section class="section">
+        <div class="section-head"><h2 class="section-title">连接</h2></div>
+        <div class="grid">
+          <div class="field full">
+            <span class="label">协议</span>
+            <div class="protocols" role="radiogroup" aria-label="协议">
+              <label><input type="radio" name="protocol" value="openai-chat-completions"><span>OpenAI Chat Completions</span></label>
+              <label><input type="radio" name="protocol" value="openai-responses"><span>OpenAI Responses</span></label>
+              <label><input type="radio" name="protocol" value="anthropic-messages"><span>Anthropic Messages</span></label>
+              <label><input type="radio" name="protocol" value="gemini"><span>Gemini</span></label>
+            </div>
+          </div>
+          <div class="field"><label for="provider-name">名称</label><input id="provider-name" name="name" required maxlength="100"></div>
+          <div class="field wide"><label for="base-url">Base URL</label><input id="base-url" name="base-url" type="url" required placeholder="https://api.example.com/v1"></div>
+          <div class="field"><label for="prefix">模型前缀</label><input id="prefix" name="prefix" placeholder="team"></div>
+          <div class="field"><label for="provider-priority">提供商优先级</label><input id="provider-priority" name="priority" type="number" min="-1000000" max="1000000" step="1" value="0"></div>
+          <div class="field"><label for="test-model">测试模型</label><input id="test-model" name="test-model"></div>
+          <div class="field wide">
+            <span class="label">状态</span>
+            <div class="toggles">
+              <label class="toggle"><input id="provider-disabled" type="checkbox"><span>停用提供商</span></label>
+              <label class="toggle"><input id="disable-cooling" type="checkbox"><span>关闭 Key 冷却</span></label>
+            </div>
+          </div>
+          <div class="field full">
+            <div class="section-head"><span class="label">自定义请求头</span><button class="btn small" id="add-header" type="button">+ 添加</button></div>
+            <div class="rows" id="headers-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-head">
+          <div><h2 class="section-title">API Keys</h2><span class="count" id="keys-count">0</span></div>
+          <button class="btn small" id="add-key" type="button">+ 添加 Key</button>
+        </div>
+        <div class="rows" id="keys-list"></div>
+      </section>
+
+      <section class="section">
+        <div class="section-head">
+          <div><h2 class="section-title">模型</h2><span class="count" id="models-count">0</span></div>
+          <button class="btn small" id="add-model" type="button">+ 添加模型</button>
+        </div>
+        <div class="rows" id="models-list"></div>
+      </section>
+
+      <section class="section">
+        <div class="section-head"><h2 class="section-title">连接测试</h2></div>
+        <div class="testbar">
+          <div><label for="test-key">API Key</label><select id="test-key"></select></div>
+          <div><label for="test-model-select">模型</label><select id="test-model-select"></select></div>
+          <button class="btn" id="test-button" type="button">测试连接</button>
+        </div>
+        <div class="test-result" id="test-result" role="status"></div>
+      </section>
+    </form>
+  </main>
+
+  <div class="auth-modal" id="auth-modal" role="dialog" aria-modal="true" aria-labelledby="auth-title" hidden>
+    <form class="dialog" id="auth-form">
+      <h2 id="auth-title">管理密钥</h2>
+      <label for="management-key">Management Key</label>
+      <input id="management-key" type="password" autocomplete="current-password" required>
+      <div class="dialog-actions"><button class="btn primary" type="submit">连接</button></div>
+    </form>
+  </div>
+  <div class="notice" id="notice" role="status" hidden></div>
+
+  <script>
+  (() => {
+    'use strict';
+    const PLUGIN_ID = 'multi-protocol-provider';
+    const STORAGE_KEY = 'cpa:multi-protocol-provider:management-key';
+    const MANAGEMENT = '/v0/management';
+    const API = `${MANAGEMENT}/plugins/${PLUGIN_ID}`;
+    const state = { config: null, credentialDestination: null, keys: [], noticeTimer: 0, busy: false };
+    const $ = (selector, root = document) => root.querySelector(selector);
+    const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
+    const app = $('#app');
+    const form = $('#provider-form');
+    const authModal = $('#auth-modal');
+    const managementKey = $('#management-key');
+
+    function getToken() { try { return sessionStorage.getItem(STORAGE_KEY) || ''; } catch (_) { return ''; } }
+    function setToken(value) { try { value ? sessionStorage.setItem(STORAGE_KEY, value) : sessionStorage.removeItem(STORAGE_KEY); } catch (_) {} }
+    function showAuth() { authModal.hidden = false; managementKey.value = getToken(); setTimeout(() => managementKey.focus(), 0); }
+    function hideAuth() { authModal.hidden = true; }
+    function notify(message, kind = '') {
+      const el = $('#notice');
+      clearTimeout(state.noticeTimer);
+      el.textContent = message;
+      el.className = `notice ${kind}`;
+      el.hidden = false;
+      state.noticeTimer = setTimeout(() => { el.hidden = true; }, 4200);
+    }
+    function setBusy(value) {
+      state.busy = value;
+      app.classList.toggle('loading', value);
+      app.setAttribute('aria-busy', String(value));
+      $('#save-button').disabled = value;
+      $('#test-button').disabled = value;
+    }
+    function setConnected(value) {
+      $('#status-dot').classList.toggle('ready', value);
+      $('#status-text').textContent = value ? '已连接' : '未连接';
+    }
+    async function request(path, options = {}) {
+      const token = getToken();
+      if (!token) { showAuth(); throw new Error('需要管理密钥'); }
+      const headers = new Headers(options.headers || {});
+      headers.set('Authorization', `Bearer ${token}`);
+      if (options.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+      const response = await fetch(path, { ...options, headers, cache: 'no-store' });
+      let body = null;
+      const text = await response.text();
+      if (text) { try { body = JSON.parse(text); } catch (_) { body = { message: text }; } }
+      if (!response.ok) {
+        if (response.status === 401) { setToken(''); setConnected(false); showAuth(); }
+        throw new Error(body?.message || body?.error || `HTTP ${response.status}`);
+      }
+      return body;
+    }
+    const escapeText = (value) => String(value ?? '');
+    function element(tag, attrs = {}, children = []) {
+      const node = document.createElement(tag);
+      for (const [key, value] of Object.entries(attrs)) {
+        if (key === 'class') node.className = value;
+        else if (key === 'text') node.textContent = escapeText(value);
+        else if (key.startsWith('on')) node.addEventListener(key.slice(2), value);
+        else if (value === true) node.setAttribute(key, '');
+        else if (value !== false && value != null) node.setAttribute(key, String(value));
+      }
+      for (const child of children) node.append(child);
+      return node;
+    }
+    function field(labelText, input) {
+      const label = element('label', { text: labelText });
+      label.append(input);
+      return label;
+    }
+    function textInput(value = '', attrs = {}) {
+      const input = element('input', attrs);
+      input.value = value ?? '';
+      return input;
+    }
+    function checkbox(value, labelText) {
+      const input = element('input', { type: 'checkbox' });
+      input.checked = Boolean(value);
+      return element('label', { class: 'toggle' }, [input, element('span', { text: labelText })]);
+    }
+    function empty(text) { return element('div', { class: 'empty', text }); }
+
+    function renderHeaders(headers = {}) {
+      const list = $('#headers-list');
+      list.replaceChildren();
+      for (const [name, value] of Object.entries(headers)) addHeaderRow(name, value);
+      if (!list.children.length) list.append(empty('暂无自定义请求头'));
+    }
+    function addHeaderRow(name = '', value = '') {
+      const list = $('#headers-list');
+      $('.empty', list)?.remove();
+      const nameInput = textInput(name, { placeholder: 'Header-Name', 'aria-label': '请求头名称' });
+      const valueInput = textInput(value, { placeholder: 'Value', 'aria-label': '请求头值' });
+      const remove = element('button', { class: 'btn icon danger', type: 'button', title: '删除请求头', 'aria-label': '删除请求头', text: '×' });
+      const row = element('div', { class: 'row' }, [field('名称', nameInput), field('值', valueInput), remove]);
+      remove.addEventListener('click', () => { row.remove(); if (!list.children.length) list.append(empty('暂无自定义请求头')); });
+      list.append(row);
+    }
+
+    function newID(prefix) {
+      if (globalThis.crypto?.randomUUID) return `${prefix}-${crypto.randomUUID()}`;
+      return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    }
+    function renderKeys(keys = []) {
+      state.keys = keys.map((key) => ({ ...key }));
+      const list = $('#keys-list');
+      list.replaceChildren();
+      state.keys.forEach((key) => list.append(keyItem(key)));
+      if (!state.keys.length) list.append(empty('暂无 API Key'));
+      updateCountsAndTestOptions();
+    }
+    function keyItem(key) {
+      const wrap = element('article', { class: 'item', 'data-key-id': key.id || newID('key') });
+      wrap.dataset.proxyDisplay = key['proxy-url'] || '';
+      wrap.dataset.proxySecretPresent = String(Boolean(key['proxy-secret-present']));
+      const labelInput = textInput(key.label, { maxlength: 128, placeholder: 'Primary' });
+      const secretInput = textInput('', { type: 'password', autocomplete: 'new-password', placeholder: key.masked || (key['secret-present'] ? '保持现有 Key' : 'sk-...') });
+      const reveal = element('button', { class: 'btn small', type: 'button', title: '显示或隐藏 Key', 'aria-label': '显示或隐藏 Key', text: '显示' });
+      reveal.addEventListener('click', () => {
+        secretInput.type = secretInput.type === 'password' ? 'text' : 'password';
+        reveal.textContent = secretInput.type === 'password' ? '显示' : '隐藏';
+      });
+      const proxyInput = textInput(key['proxy-url'], { placeholder: 'http://127.0.0.1:7890、socks5://... 或 direct' });
+      const priorityInput = textInput(key.priority ?? 0, { type: 'number', min: -1000000, max: 1000000, step: 1 });
+      const disabled = checkbox(key.disabled, '停用');
+      disabled.querySelector('input').className = 'key-disabled';
+      const remove = element('button', { class: 'btn icon danger', type: 'button', title: '删除 Key', 'aria-label': '删除 Key', text: '×' });
+      const title = element('div', { class: 'item-name', text: key.label || key.masked || '新 API Key' });
+      labelInput.addEventListener('input', () => { title.textContent = labelInput.value || key.masked || '新 API Key'; });
+      const head = element('div', { class: 'item-head' }, [title, element('div', { class: 'item-actions' }, [disabled, remove])]);
+      const secretWrap = element('div', { class: 'secret-wrap' }, [secretInput, reveal]);
+      const grid = element('div', { class: 'key-grid' }, [field('标签', labelInput), field('API Key', secretWrap), field('代理 URL', proxyInput), field('优先级', priorityInput)]);
+      wrap.append(head, grid);
+      remove.addEventListener('click', () => { wrap.remove(); updateCountsAndTestOptions(); if (!$('#keys-list').children.length) $('#keys-list').append(empty('暂无 API Key')); });
+      return wrap;
+    }
+
+    function renderModels(models = []) {
+      const list = $('#models-list');
+      list.replaceChildren();
+      models.forEach((model) => list.append(modelItem(model)));
+      if (!models.length) list.append(empty('暂无模型'));
+      updateCountsAndTestOptions();
+    }
+    function modelItem(model = {}) {
+      const wrap = element('article', { class: 'item' });
+      const name = textInput(model.name, { required: true, placeholder: 'model-name' });
+      const alias = textInput(model.alias, { placeholder: 'public-name' });
+      const display = textInput(model['display-name'], { placeholder: 'Display name' });
+      const force = checkbox(model['force-mapping'], '强制映射'); force.querySelector('input').className = 'model-force';
+      const image = checkbox(model.image, '图片端点'); const imageInput = image.querySelector('input'); imageInput.className = 'model-image';
+      const inputMods = textInput((model['input-modalities'] || []).join(', '), { placeholder: 'text, image' });
+      const outputMods = textInput((model['output-modalities'] || []).join(', '), { placeholder: 'text, image' });
+      const thinking = model.thinking || {};
+      const thinkMin = textInput(thinking.min ?? '', { type: 'number', min: 0, step: 1, placeholder: '0' });
+      const thinkMax = textInput(thinking.max ?? '', { type: 'number', min: 0, step: 1, placeholder: '32768' });
+      const thinkLevels = textInput((thinking.levels || []).join(', '), { placeholder: 'low, medium, high' });
+      const zero = checkbox(thinking['zero-allowed'], '允许 0'); zero.querySelector('input').className = 'thinking-zero';
+      const dynamic = checkbox(thinking['dynamic-allowed'], '允许动态预算'); dynamic.querySelector('input').className = 'thinking-dynamic';
+      const detail = element('div', { class: 'model-detail', hidden: true }, [
+        field('输入模态', inputMods), field('输出模态', outputMods), field('思考最小值', thinkMin), field('思考最大值', thinkMax),
+        element('div', { class: 'span-2' }, [field('思考等级', thinkLevels)]),
+        element('div', { class: 'span-2 toggles' }, [force, image, zero, dynamic])
+      ]);
+      const more = element('button', { class: 'btn small', type: 'button', text: '参数' });
+      const remove = element('button', { class: 'btn icon danger', type: 'button', title: '删除模型', 'aria-label': '删除模型', text: '×' });
+      const title = element('div', { class: 'item-name', text: model.alias || model.name || '新模型' });
+      name.addEventListener('input', () => { title.textContent = alias.value || name.value || '新模型'; updateCountsAndTestOptions(); });
+      alias.addEventListener('input', () => { title.textContent = alias.value || name.value || '新模型'; updateCountsAndTestOptions(); });
+      imageInput.addEventListener('change', updateCountsAndTestOptions);
+      more.addEventListener('click', () => { detail.hidden = !detail.hidden; more.textContent = detail.hidden ? '参数' : '收起'; });
+      remove.addEventListener('click', () => { wrap.remove(); updateCountsAndTestOptions(); if (!$('#models-list').children.length) $('#models-list').append(empty('暂无模型')); });
+      wrap.append(element('div', { class: 'item-head' }, [title, element('div', { class: 'item-actions' }, [more, remove])]), element('div', { class: 'model-main' }, [field('上游模型名', name), field('别名', alias), field('显示名称', display)]), detail);
+      return wrap;
+    }
+
+    function commaList(value) { return value.split(',').map((v) => v.trim().toLowerCase()).filter((v, i, all) => v && all.indexOf(v) === i); }
+    function collectConfig() {
+      const headers = {};
+      $$('#headers-list .row').forEach((row) => {
+        const inputs = $$('input', row); const name = inputs[0].value.trim();
+        if (name) headers[name] = inputs[1].value.trim();
+      });
+      const models = $$('#models-list .item').map((item) => {
+        const main = $$('.model-main input', item);
+        const detail = $$('.model-detail input', item);
+        const thinking = {};
+        if (detail[2].value !== '') thinking.min = Number(detail[2].value);
+        if (detail[3].value !== '') thinking.max = Number(detail[3].value);
+        const levels = commaList(detail[4].value); if (levels.length) thinking.levels = levels;
+        if ($('.thinking-zero', item).checked) thinking['zero-allowed'] = true;
+        if ($('.thinking-dynamic', item).checked) thinking['dynamic-allowed'] = true;
+        const result = { name: main[0].value.trim() };
+        if (main[1].value.trim()) result.alias = main[1].value.trim();
+        if (main[2].value.trim()) result['display-name'] = main[2].value.trim();
+        if ($('.model-force', item).checked) result['force-mapping'] = true;
+        if ($('.model-image', item).checked) result.image = true;
+        const inputModalities = commaList(detail[0].value); if (inputModalities.length) result['input-modalities'] = inputModalities;
+        const outputModalities = commaList(detail[1].value); if (outputModalities.length) result['output-modalities'] = outputModalities;
+        if (Object.keys(thinking).length) result.thinking = thinking;
+        return result;
+      });
+      return {
+        name: $('#provider-name').value.trim(),
+        priority: Number($('#provider-priority').value || 0),
+        protocol: $('input[name="protocol"]:checked')?.value || 'openai-chat-completions',
+        'base-url': $('#base-url').value.trim(),
+        prefix: $('#prefix').value.trim(),
+        disabled: $('#provider-disabled').checked,
+        'disable-cooling': $('#disable-cooling').checked,
+        headers,
+        models,
+        'test-model': $('#test-model').value.trim()
+      };
+    }
+    function collectKeys() {
+      return $$('#keys-list .item').map((item) => {
+        const fields = $$('.key-grid input', item);
+        const result = {
+          id: item.dataset.keyId,
+          label: fields[0].value.trim(),
+          'api-key': fields[1].value.trim(),
+          'proxy-url': fields[2].value.trim(),
+          priority: Number(fields[3].value || 0),
+          disabled: $('.key-disabled', item).checked
+        };
+        if (item.dataset.proxySecretPresent === 'true' && result['proxy-url'] === item.dataset.proxyDisplay) {
+          result['preserve-proxy-url'] = true;
+        }
+        return result;
+      });
+    }
+    function fillConfig(config) {
+      state.config = config;
+      $('#page-title').textContent = config.name || '通用提供商';
+      $('#provider-name').value = config.name || '';
+      $('#provider-priority').value = config.priority ?? 0;
+      $('#base-url').value = config['base-url'] || '';
+      $('#prefix').value = config.prefix || '';
+      $('#test-model').value = config['test-model'] || '';
+      $('#provider-disabled').checked = Boolean(config.disabled);
+      $('#disable-cooling').checked = Boolean(config['disable-cooling']);
+      const radio = $(`input[name="protocol"][value="${CSS.escape(config.protocol || 'openai-chat-completions')}"]`);
+      if (radio) radio.checked = true;
+      renderHeaders(config.headers || {});
+      renderModels(config.models || []);
+    }
+    function stripTestThinkingSuffix(value) {
+      const match = String(value || '').trim().match(/^(.*)\(([^()]*)\)$/);
+      if (!match) return String(value || '').trim();
+      const suffix = match[2].toLowerCase();
+      const named = ['none', 'auto', '-1', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+      const numeric = /^[+-]?\d+$/.test(suffix) && Number(suffix) >= 0;
+      if (!named.includes(suffix) && !numeric) return String(value || '').trim();
+      return match[1].trim();
+    }
+    function modelIDsForTest(item) {
+      const inputs = $$('.model-main input', item);
+      const name = inputs[0].value.trim(); const alias = inputs[1].value.trim(); const id = alias || name;
+      const prefix = $('#prefix').value.trim().replace(/^\/+|\/+$/g, '');
+      return [name, id, prefix && id ? `${prefix}/${id}` : ''].filter(Boolean);
+    }
+    function updateCountsAndTestOptions() {
+      const keyItems = $$('#keys-list .item');
+      const modelItems = $$('#models-list .item');
+      $('#keys-count').textContent = `${keyItems.length} 个 Key`;
+      $('#models-count').textContent = `${modelItems.length} 个模型`;
+      const keySelect = $('#test-key'); const previousKey = keySelect.value; keySelect.replaceChildren();
+      keyItems.forEach((item, index) => {
+        const label = $('.key-grid input', item)?.value || `Key ${index + 1}`;
+        keySelect.append(element('option', { value: item.dataset.keyId, text: label }));
+      });
+      if ([...keySelect.options].some((o) => o.value === previousKey)) keySelect.value = previousKey;
+      const modelSelect = $('#test-model-select'); const previousModel = modelSelect.value; modelSelect.replaceChildren();
+      const imageModelIDs = new Set();
+      modelItems.forEach((item) => {
+        const ids = modelIDsForTest(item);
+        if ($('.model-image', item).checked) { ids.forEach((id) => imageModelIDs.add(id)); return; }
+        const inputs = $$('.model-main input', item); const value = inputs[1].value.trim() || inputs[0].value.trim();
+        if (value) modelSelect.append(element('option', { value, text: value }));
+      });
+      const configured = $('#test-model').value.trim();
+      const configuredIsImage = imageModelIDs.has(stripTestThinkingSuffix(configured));
+      if (configured && !configuredIsImage && ![...modelSelect.options].some((o) => o.value === configured)) modelSelect.prepend(element('option', { value: configured, text: configured }));
+      if ([...modelSelect.options].some((o) => o.value === previousModel)) modelSelect.value = previousModel;
+      else if (configured && !configuredIsImage) modelSelect.value = configured;
+    }
+    function validate(config, keys, requireAllCredentialReentry = true) {
+      if (!form.reportValidity()) return false;
+      if (!config['base-url']) { notify('Base URL 不能为空', 'error'); return false; }
+      try {
+        const url = new URL(config['base-url']);
+        if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error();
+      } catch (_) { notify('Base URL 必须是无认证、无查询参数和片段的 HTTP(S) 地址', 'error'); return false; }
+      if (config.models.some((model) => !model.name)) { notify('模型名称不能为空', 'error'); return false; }
+      const publicIDs = config.models.map((model) => {
+        const base = model.alias || model.name;
+        return config.prefix ? [base, `${config.prefix}/${base}`] : [base];
+      });
+      const seenPublicIDs = new Set();
+      if (publicIDs.some((modelIDs) => modelIDs.some((id) => seenPublicIDs.has(id) || !seenPublicIDs.add(id)))) {
+        notify('模型 ID 不能重复', 'error'); return false;
+      }
+      if (publicIDs.some((modelIDs, publicIndex) => modelIDs.some((id) => config.models.some((model, upstreamIndex) => upstreamIndex !== publicIndex && model.name === id)))) {
+        notify('公开模型 ID 不能与另一个上游模型名重复', 'error'); return false;
+      }
+      const savedProtocol = state.config?.protocol || 'openai-chat-completions';
+      const savedBaseURL = String(state.config?.['base-url'] || '').trim().replace(/\/+$/, '');
+      const nextBaseURL = String(config['base-url'] || '').trim().replace(/\/+$/, '');
+      const boundProtocol = state.credentialDestination?.protocol || '';
+      const boundBaseURL = String(state.credentialDestination?.['base-url'] || '').trim().replace(/\/+$/, '');
+      const destinationChanged = savedProtocol !== config.protocol || savedBaseURL !== nextBaseURL ||
+        boundProtocol !== config.protocol || boundBaseURL !== nextBaseURL;
+      if (requireAllCredentialReentry && destinationChanged && keys.some((key) => !key['api-key'] || key['preserve-proxy-url'])) {
+        notify('切换协议或 Base URL 时，必须重新输入所有 API Key 和带认证信息的代理 URL', 'error');
+        return false;
+      }
+      return true;
+    }
+    async function load() {
+      setBusy(true);
+      try {
+        const data = await request(`${API}/state`);
+        state.credentialDestination = data['credential-destination'] || null;
+        fillConfig(data.config || {});
+        renderKeys(data.keys || []);
+        setConnected(true);
+        hideAuth();
+      } catch (error) { setConnected(false); if (getToken()) notify(error.message, 'error'); }
+      finally { setBusy(false); }
+    }
+    async function waitUntilProviderDisabled() {
+      const deadline = Date.now() + 10000;
+      let lastError;
+      while (Date.now() < deadline) {
+        try {
+          const data = await request(`${API}/state`);
+          if (data.config?.disabled === true) return;
+        } catch (error) { lastError = error; }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      throw lastError || new Error('等待提供商停用超时');
+    }
+    async function save() {
+      const config = collectConfig(); const keys = collectKeys();
+      if (!validate(config, keys)) return;
+      setBusy(true);
+      let disabledConfirmed = false;
+      try {
+        await request(`${MANAGEMENT}/plugins/${PLUGIN_ID}/config`, { method: 'PATCH', body: JSON.stringify({ disabled: true }) });
+        await waitUntilProviderDisabled();
+        disabledConfirmed = true;
+        await request(`${API}/keys`, {
+          method: 'PUT',
+          body: JSON.stringify({ keys, destination: { protocol: config.protocol, 'base-url': config['base-url'] } })
+        });
+        await request(`${MANAGEMENT}/plugins/${PLUGIN_ID}/config`, { method: 'PATCH', body: JSON.stringify(config) });
+        state.config = config;
+        $('#page-title').textContent = config.name;
+        notify('配置已保存', 'success');
+        setTimeout(load, 450);
+      } catch (error) {
+        if (disabledConfirmed) {
+          $('#provider-disabled').checked = true;
+          notify(`保存未完成，提供商保持停用：${error.message}`, 'error');
+        } else {
+          notify(error.message, 'error');
+        }
+      }
+      finally { setBusy(false); }
+    }
+    async function testConnection() {
+      const config = collectConfig(); const keys = collectKeys();
+      if (!validate(config, keys, false)) return;
+      const keyID = $('#test-key').value; const key = keys.find((item) => item.id === keyID);
+      const model = $('#test-model-select').value || config['test-model'];
+      if (!key || !model) { notify('请选择 Key 和模型', 'error'); return; }
+      const output = $('#test-result'); output.className = 'test-result'; output.textContent = '正在测试...';
+      setBusy(true);
+      try {
+        const result = await request(`${API}/test`, { method: 'POST', body: JSON.stringify({ config, key, model }) });
+        output.className = 'test-result ok';
+        output.textContent = `${result.message || '连接成功'}${result['latency-ms'] != null ? ` · ${result['latency-ms']} ms` : ''}`;
+      } catch (error) { output.className = 'test-result fail'; output.textContent = error.message; }
+      finally { setBusy(false); }
+    }
+
+    $('#add-header').addEventListener('click', () => addHeaderRow());
+    $('#add-key').addEventListener('click', () => { $('.empty', $('#keys-list'))?.remove(); $('#keys-list').append(keyItem({ id: newID('key') })); updateCountsAndTestOptions(); });
+    $('#add-model').addEventListener('click', () => { $('.empty', $('#models-list'))?.remove(); $('#models-list').append(modelItem({})); updateCountsAndTestOptions(); });
+    $('#auth-button').addEventListener('click', showAuth);
+    $('#save-button').addEventListener('click', save);
+    $('#test-button').addEventListener('click', testConnection);
+    $('#test-model').addEventListener('input', updateCountsAndTestOptions);
+    $('#prefix').addEventListener('input', updateCountsAndTestOptions);
+    $('#auth-form').addEventListener('submit', (event) => { event.preventDefault(); const value = managementKey.value.trim(); if (!value) return; setToken(value); load(); });
+    form.addEventListener('submit', (event) => { event.preventDefault(); save(); });
+    if (getToken()) load(); else { setBusy(false); showAuth(); }
+  })();
+  </script>
+</body>
+</html>
