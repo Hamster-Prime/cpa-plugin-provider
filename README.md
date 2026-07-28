@@ -20,20 +20,39 @@
 
 ## 安装
 
-### 官方插件商店（推荐）
+### 自定义插件库（推荐）
 
-1. 打开 CPA 管理中心的“插件商店”。
-2. 搜索 **Multi-Protocol Provider** 并点击安装；CPA 会自动下载当前操作系统和架构的发布包并校验文件。
-3. 如果 CPA 的全局插件开关尚未开启，按管理中心提示启用插件功能。
-4. 安装完成后，在“插件”菜单打开“通用提供商”。
-5. 首次打开时输入 CPA 的 Management Key（`remote-management.secret-key`）。该 Key 只保存在当前页面内存中，不写入浏览器存储。
-6. 选择上游协议，填写 Base URL、模型和 API Key，然后保存并使用“测试连接”验证。
+本项目提供符合 CPA 插件商店规范的自定义库：
 
-如果商店中暂时搜索不到该插件，表示官方 registry 条目尚未合并或尚未同步，请先使用下方的手动安装方式。
+```text
+https://raw.githubusercontent.com/Hamster-Prime/cpa-plugin-provider/main/registry.json
+```
+
+在 CPA 的 `config.yaml` 中，把该地址加入 `plugins.store-sources`：
+
+```yaml
+plugins:
+  enabled: true
+  dir: plugins
+  store-sources:
+    - "https://raw.githubusercontent.com/Hamster-Prime/cpa-plugin-provider/main/registry.json"
+```
+
+如果配置文件中已经存在 `plugins:`，只需把 `store-sources` 合并到现有节点，不要创建第二个 `plugins:`。自定义库会与 CPA 内置官方库同时显示，不会覆盖官方库。
+
+CPA 需要能够访问 `raw.githubusercontent.com`、`api.github.com` 和 GitHub Release 下载地址；网络受限时请先配置 CPA 的全局 `proxy-url`。全局 `plugins.enabled` 不会因安装动作自动开启，因此应保留上例中的 `enabled: true`。
+
+1. 保存配置并重启 CPA，或使用现有的配置重载方式使其生效。
+2. 打开 CPA 管理中心的“插件商店”并刷新列表。
+3. 搜索 **Multi-Protocol Provider**，确认来源为上述自定义库，然后点击安装。CPA 会选择当前操作系统和架构对应的 Release ZIP，并使用发布页中的 `checksums.txt` 校验文件。
+4. 如果 CPA 的全局插件开关尚未开启，按管理中心提示启用插件功能。
+5. 安装完成后，在“插件”菜单打开“通用提供商”。
+6. 首次打开时输入 CPA 的 Management Key（`remote-management.secret-key`）。该 Key 只保存在当前页面内存中，不写入浏览器存储。
+7. 选择上游协议，填写 Base URL、模型和 API Key，然后保存并使用“测试连接”验证。
 
 “通用提供商”是插件的完整配置 GUI，可直接维护提供商名称、协议、Base URL、自定义请求头、模型与别名、图片模型、输入/输出模态、思考参数，以及带代理和优先级的多个 API Key。配置和凭据操作均通过 CPA 认证后的 Management API 完成，不需要手工编辑 YAML 或凭据文件。
 
-插件更新和卸载也应从 CPA 插件商店执行。如果 CPA 提示需要重启，请完成重启后再继续使用；Windows 上更新已加载的动态库时通常必须重启。
+后续更新和卸载也从 CPA 插件商店执行；自定义库会读取本仓库的最新正式 Release，不需要每次修改库地址。如果 CPA 提示需要重启，请完成重启后再继续使用；Windows 上更新已加载的动态库时通常必须重启。
 
 ### 手动安装（备选）
 
