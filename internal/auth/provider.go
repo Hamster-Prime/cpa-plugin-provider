@@ -133,7 +133,7 @@ func (p *Provider) ParseAuth(_ context.Context, req pluginapi.AuthParseRequest) 
 		return pluginapi.AuthParseResponse{}, nil
 	}
 
-	auths, err := p.buildAuths(req.FileName, credential)
+	auths, err := p.buildAuths(req.FileName, credential, req.Host.ProxyURL)
 	if err != nil {
 		return pluginapi.AuthParseResponse{Handled: true}, err
 	}
@@ -153,11 +153,14 @@ func (p *Provider) PollLogin(context.Context, pluginapi.AuthLoginPollRequest) (p
 }
 
 func (p *Provider) RefreshAuth(_ context.Context, req pluginapi.AuthRefreshRequest) (pluginapi.AuthRefreshResponse, error) {
-	key, destination, err := parseStoredKey(req.StorageJSON)
+	key, destination, hostProxyURL, err := parseStoredKey(req.StorageJSON)
 	if err != nil {
 		return pluginapi.AuthRefreshResponse{}, err
 	}
-	data, err := p.authData(req.AuthID, "", key, destination)
+	if strings.TrimSpace(req.Host.AuthDir) != "" {
+		hostProxyURL = req.Host.ProxyURL
+	}
+	data, err := p.authData(req.AuthID, "", key, destination, hostProxyURL)
 	if err != nil {
 		return pluginapi.AuthRefreshResponse{}, err
 	}
@@ -172,7 +175,7 @@ func (p *Provider) RefreshAuth(_ context.Context, req pluginapi.AuthRefreshReque
 // StorageMatchesConfig reports whether one reconciled auth record is bound to
 // the provider's current protocol and upstream URL. It never exposes the key.
 func StorageMatchesConfig(raw []byte, cfg config.Config) bool {
-	_, destination, err := parseStoredKey(raw)
+	_, destination, _, err := parseStoredKey(raw)
 	return err == nil && destination != nil && destination.MatchesConfig(cfg)
 }
 
@@ -281,30 +284,33 @@ func MaskAPIKey(key string) string {
 func DisplayProxyURL(value string) (string, bool) {
 	value = strings.TrimSpace(value)
 	setting, err := proxyutil.Parse(value)
-	if err != nil || setting.URL == nil || setting.URL.User == nil {
+	if err != nil {
+		return proxyutil.Redact(value), true
+	}
+	if setting.URL == nil {
 		return value, false
 	}
-	return proxyutil.Redact(value), true
+	sensitiveOrHidden := setting.URL.User != nil || setting.URL.Path != "" || setting.URL.RawQuery != "" || setting.URL.Fragment != ""
+	return proxyutil.Redact(value), sensitiveOrHidden
 }
 
-func (p *Provider) buildAuths(fileName string, credential CredentialFile) ([]pluginapi.AuthData, error) {
+func (p *Provider) buildAuths(fileName string, credential CredentialFile, hostProxyURL string) ([]pluginapi.AuthData, error) {
 	fileName = filepath.Base(strings.TrimSpace(fileName))
 	if fileName == "." || fileName == "" {
 		fileName = provider.CredentialsFile
 	}
-	if len(credential.Keys) == 0 {
-		placeholder := Key{ID: "empty", Label: p.config.Name, Disabled: true}
-		data, err := p.authData(fileName, fileName, placeholder, credential.Destination)
-		if err != nil {
-			return nil, err
-		}
-		data.Metadata["empty"] = true
-		return []pluginapi.AuthData{data}, nil
+	if err := validateProxyURL(hostProxyURL); err != nil {
+		return nil, fmt.Errorf("host proxy URL: %w", err)
 	}
 
-	auths := make([]pluginapi.AuthData, 0, len(credential.Keys))
+	controller, errController := p.controllerAuthData(fileName, credential.Destination, hostProxyURL, len(credential.Keys) == 0)
+	if errController != nil {
+		return nil, errController
+	}
+	auths := make([]pluginapi.AuthData, 0, len(credential.Keys)+1)
+	auths = append(auths, controller)
 	for _, key := range credential.Keys {
-		data, err := p.authData(authID(fileName, key.ID), fileName, key, credential.Destination)
+		data, err := p.authData(authID(fileName, key.ID), fileName, key, credential.Destination, hostProxyURL)
 		if err != nil {
 			return nil, err
 		}
@@ -313,25 +319,58 @@ func (p *Provider) buildAuths(fileName string, credential CredentialFile) ([]plu
 	return auths, nil
 }
 
-func (p *Provider) authData(id, fileName string, key Key, destination *CredentialDestination) (pluginapi.AuthData, error) {
+func (p *Provider) controllerAuthData(fileName string, destination *CredentialDestination, hostProxyURL string, empty bool) (pluginapi.AuthData, error) {
 	stored, err := json.Marshal(struct {
-		Type        string                 `json:"type"`
-		Destination *CredentialDestination `json:"destination,omitempty"`
-		ID          string                 `json:"id,omitempty"`
-		Label       string                 `json:"label,omitempty"`
-		APIKey      string                 `json:"api-key,omitempty"`
-		ProxyURL    string                 `json:"proxy-url,omitempty"`
-		Priority    int                    `json:"priority,omitempty"`
-		Disabled    bool                   `json:"disabled,omitempty"`
+		Type         string                 `json:"type"`
+		Destination  *CredentialDestination `json:"destination,omitempty"`
+		Controller   bool                   `json:"controller"`
+		HostProxyURL string                 `json:"host-proxy-url,omitempty"`
 	}{
-		Type:        provider.ID,
-		Destination: destination,
-		ID:          key.ID,
-		Label:       key.Label,
-		APIKey:      key.APIKey,
-		ProxyURL:    key.ProxyURL,
-		Priority:    key.Priority,
-		Disabled:    key.Disabled,
+		Type:         provider.ID,
+		Destination:  destination,
+		Controller:   true,
+		HostProxyURL: strings.TrimSpace(hostProxyURL),
+	})
+	if err != nil {
+		return pluginapi.AuthData{}, fmt.Errorf("encode %s controller storage: %w", provider.ID, err)
+	}
+	metadata := map[string]any{"controller": true}
+	if empty {
+		metadata["empty"] = true
+	}
+	return pluginapi.AuthData{
+		Provider:    provider.ID,
+		ID:          fileName,
+		FileName:    fileName,
+		Label:       p.config.Name,
+		Disabled:    true,
+		StorageJSON: stored,
+		Metadata:    metadata,
+		Attributes:  map[string]string{"auth_kind": "controller"},
+	}, nil
+}
+
+func (p *Provider) authData(id, fileName string, key Key, destination *CredentialDestination, hostProxyURL string) (pluginapi.AuthData, error) {
+	stored, err := json.Marshal(struct {
+		Type         string                 `json:"type"`
+		Destination  *CredentialDestination `json:"destination,omitempty"`
+		ID           string                 `json:"id,omitempty"`
+		Label        string                 `json:"label,omitempty"`
+		APIKey       string                 `json:"api-key,omitempty"`
+		ProxyURL     string                 `json:"proxy-url,omitempty"`
+		HostProxyURL string                 `json:"host-proxy-url,omitempty"`
+		Priority     int                    `json:"priority,omitempty"`
+		Disabled     bool                   `json:"disabled,omitempty"`
+	}{
+		Type:         provider.ID,
+		Destination:  destination,
+		ID:           key.ID,
+		Label:        key.Label,
+		APIKey:       key.APIKey,
+		ProxyURL:     key.ProxyURL,
+		HostProxyURL: strings.TrimSpace(hostProxyURL),
+		Priority:     key.Priority,
+		Disabled:     key.Disabled,
 	})
 	if err != nil {
 		return pluginapi.AuthData{}, fmt.Errorf("encode %s key storage: %w", provider.ID, err)
@@ -371,30 +410,34 @@ func (p *Provider) authData(id, fileName string, key Key, destination *Credentia
 	}, nil
 }
 
-func parseStoredKey(raw []byte) (Key, *CredentialDestination, error) {
+func parseStoredKey(raw []byte) (Key, *CredentialDestination, string, error) {
 	if len(strings.TrimSpace(string(raw))) == 0 {
-		return Key{}, nil, fmt.Errorf("%s auth storage is empty", provider.ID)
+		return Key{}, nil, "", fmt.Errorf("%s auth storage is empty", provider.ID)
 	}
 	var probe struct {
-		Type        string                 `json:"type"`
-		Destination *CredentialDestination `json:"destination"`
+		Type         string                 `json:"type"`
+		Destination  *CredentialDestination `json:"destination"`
+		HostProxyURL string                 `json:"host-proxy-url"`
 	}
 	if err := json.Unmarshal(raw, &probe); err != nil {
-		return Key{}, nil, fmt.Errorf("decode %s auth storage: %w", provider.ID, err)
+		return Key{}, nil, "", fmt.Errorf("decode %s auth storage: %w", provider.ID, err)
 	}
 	if !strings.EqualFold(strings.TrimSpace(probe.Type), provider.ID) {
-		return Key{}, nil, fmt.Errorf("unexpected auth storage type %q", probe.Type)
+		return Key{}, nil, "", fmt.Errorf("unexpected auth storage type %q", probe.Type)
 	}
 	var key Key
 	if err := json.Unmarshal(raw, &key); err != nil {
-		return Key{}, nil, fmt.Errorf("decode %s auth key: %w", provider.ID, err)
+		return Key{}, nil, "", fmt.Errorf("decode %s auth key: %w", provider.ID, err)
 	}
 	credential := CredentialFile{Type: provider.ID, Destination: probe.Destination, Keys: []Key{key}}
 	credential.Normalize()
 	if err := credential.Validate(); err != nil {
-		return Key{}, nil, err
+		return Key{}, nil, "", err
 	}
-	return credential.Keys[0], credential.Destination, nil
+	if err := validateProxyURL(probe.HostProxyURL); err != nil {
+		return Key{}, nil, "", fmt.Errorf("host proxy URL: %w", err)
+	}
+	return credential.Keys[0], credential.Destination, strings.TrimSpace(probe.HostProxyURL), nil
 }
 
 func authID(fileName, keyID string) string {

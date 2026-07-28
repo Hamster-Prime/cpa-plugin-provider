@@ -3,9 +3,7 @@ package plugin
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
-	"strings"
 
 	providerauth "github.com/Hamster-Prime/cpa-plugin-provider/internal/auth"
 	"github.com/Hamster-Prime/cpa-plugin-provider/internal/config"
@@ -44,7 +42,8 @@ func Build(configYAML []byte, dependencies Dependencies) (pluginapi.Plugin, *Pro
 	}
 	p.management = management.New(provider.ID, provider.CredentialsFile, cfg, dependencies.AuthStore, p)
 
-	formats := []string{cfg.Protocol.ExecutorFormat(), "openai-image"}
+	inputFormats := []string{cfg.Protocol.ExecutorFormat(), "openai-image"}
+	outputFormats := []string{"openai", "openai-response", "claude", "gemini", "openai-image"}
 	return pluginapi.Plugin{
 		Metadata: pluginapi.Metadata{
 			Name:             provider.DisplayName,
@@ -69,8 +68,8 @@ func Build(configYAML []byte, dependencies Dependencies) (pluginapi.Plugin, *Pro
 			Executor:      p,
 			// Auth-bound registration lets CPA apply each credential's model prefix.
 			ExecutorModelScope:    pluginapi.ExecutorModelScopeOAuth,
-			ExecutorInputFormats:  formats,
-			ExecutorOutputFormats: append([]string(nil), formats...),
+			ExecutorInputFormats:  inputFormats,
+			ExecutorOutputFormats: outputFormats,
 			ThinkingApplier:       p,
 			ManagementAPI:         p,
 		},
@@ -153,17 +152,12 @@ func (p *ProviderPlugin) HandleManagement(ctx context.Context, req pluginapi.Man
 }
 
 func (p *ProviderPlugin) TestConnection(ctx context.Context, req management.TestRequest) (management.TestResult, error) {
-	if req.HTTPClient == nil {
-		return management.TestResult{}, fmt.Errorf("host HTTP client is unavailable")
-	}
-	if strings.TrimSpace(req.Key.ProxyURL) != "" {
-		return management.TestResult{}, fmt.Errorf("connection testing with a per-key proxy is unsupported")
-	}
 	storage, err := json.Marshal(map[string]any{
 		"type":        provider.ID,
 		"destination": providerauth.DestinationForConfig(req.Config),
 		"id":          req.Key.ID,
 		"api-key":     req.Key.APIKey,
+		"proxy-url":   req.Key.ProxyURL,
 	})
 	if err != nil {
 		return management.TestResult{}, err

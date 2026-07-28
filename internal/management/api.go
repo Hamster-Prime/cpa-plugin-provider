@@ -17,14 +17,18 @@ import (
 
 	providerauth "github.com/Hamster-Prime/cpa-plugin-provider/internal/auth"
 	"github.com/Hamster-Prime/cpa-plugin-provider/internal/config"
+	"github.com/Hamster-Prime/cpa-plugin-provider/internal/executor"
 	"github.com/Hamster-Prime/cpa-plugin-provider/internal/provider"
 	"github.com/Hamster-Prime/cpa-plugin-provider/internal/ui"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 const (
-	maxRequestBody = 2 << 20
-	maxKeys        = 128
+	maxRequestBody       = 2 << 20
+	maxModelResponseBody = 2 << 20
+	maxKeys              = 128
+	defaultAuthSyncWait  = 10 * time.Second
+	defaultAuthSyncPoll  = 100 * time.Millisecond
 )
 
 // HostAuthStore is the narrow host callback surface needed by the management
@@ -80,6 +84,9 @@ type API struct {
 	config         config.Config
 	authStore      HostAuthStore
 	tester         ConnectionTester
+	httpClients    func(string) (pluginapi.HostHTTPClient, error)
+	authSyncWait   time.Duration
+	authSyncPoll   time.Duration
 	credentialMu   sync.Mutex
 }
 
@@ -99,6 +106,11 @@ func New(pluginID, credentialFile string, cfg config.Config, authStore HostAuthS
 		config:         cfg,
 		authStore:      authStore,
 		tester:         tester,
+		httpClients: func(proxyURL string) (pluginapi.HostHTTPClient, error) {
+			return executor.NewHTTPClientWithResponseLimit(proxyURL, maxModelResponseBody)
+		},
+		authSyncWait: defaultAuthSyncWait,
+		authSyncPoll: defaultAuthSyncPoll,
 	}
 }
 
@@ -110,7 +122,9 @@ func (a *API) RegisterManagement(_ context.Context, req pluginapi.ManagementRegi
 	return pluginapi.ManagementRegistrationResponse{
 		Routes: []pluginapi.ManagementRoute{
 			{Method: http.MethodGet, Path: base + "/state", Description: "Returns provider configuration and masked credentials.", Handler: a},
+			{Method: http.MethodPost, Path: base + "/validate", Description: "Validates and normalizes a draft provider configuration.", Handler: a},
 			{Method: http.MethodPut, Path: base + "/keys", Description: "Persists the provider credential pool.", Handler: a},
+			{Method: http.MethodPost, Path: base + "/models", Description: "Discovers models from a draft provider endpoint.", Handler: a},
 			{Method: http.MethodPost, Path: base + "/test", Description: "Tests the provider connection.", Handler: a},
 		},
 		Resources: []pluginapi.ResourceRoute{{
@@ -132,8 +146,12 @@ func (a *API) HandleManagement(ctx context.Context, req pluginapi.ManagementRequ
 		return resourceResponse(), nil
 	case req.Method == http.MethodGet && strings.HasSuffix(path, "/plugins/"+a.pluginID+"/state"):
 		return a.state(ctx), nil
+	case req.Method == http.MethodPost && strings.HasSuffix(path, "/plugins/"+a.pluginID+"/validate"):
+		return a.validateConfig(req.Body), nil
 	case req.Method == http.MethodPut && strings.HasSuffix(path, "/plugins/"+a.pluginID+"/keys"):
 		return a.saveKeys(ctx, req.Body), nil
+	case req.Method == http.MethodPost && strings.HasSuffix(path, "/plugins/"+a.pluginID+"/models"):
+		return a.discoverModels(ctx, req.Body), nil
 	case req.Method == http.MethodPost && strings.HasSuffix(path, "/plugins/"+a.pluginID+"/test"):
 		return a.testConnection(ctx, req.Body), nil
 	default:
@@ -165,6 +183,25 @@ func (a *API) state(ctx context.Context) pluginapi.ManagementResponse {
 		"config":                 a.config,
 		"credential-destination": credential.Destination,
 		"keys":                   keys,
+	})
+}
+
+type validateConfigRequest struct {
+	Config config.Config `json:"config"`
+}
+
+func (a *API) validateConfig(body []byte) pluginapi.ManagementResponse {
+	var input validateConfigRequest
+	if err := decodeJSON(body, &input); err != nil {
+		return jsonError(http.StatusBadRequest, "invalid_body", err.Error())
+	}
+	input.Config.Normalize()
+	if err := input.Config.Validate(); err != nil {
+		return jsonError(http.StatusBadRequest, "invalid_config", err.Error())
+	}
+	return jsonResponse(http.StatusOK, map[string]any{
+		"status": "ok",
+		"config": input.Config,
 	})
 }
 
@@ -259,16 +296,263 @@ func (a *API) saveKeys(ctx context.Context, body []byte) pluginapi.ManagementRes
 	if err != nil {
 		return jsonError(http.StatusBadRequest, "invalid_credentials", err.Error())
 	}
-	if existingRaw, errExisting := providerauth.MarshalCredentialFile(existing); errExisting == nil && bytes.Equal(existingRaw, raw) {
-		return jsonResponse(http.StatusOK, map[string]any{"status": "ok", "keys": keyViews(keys)})
+	existingRaw, errExisting := providerauth.MarshalCredentialFile(existing)
+	savedAt := time.Time{}
+	if errExisting != nil || !bytes.Equal(existingRaw, raw) {
+		savedAt = time.Now().UTC()
+		if _, err = a.authStore.SaveAuth(ctx, pluginapi.HostAuthSaveRequest{
+			Name: a.credentialFile,
+			JSON: json.RawMessage(raw),
+		}); err != nil {
+			return jsonError(http.StatusInternalServerError, "credential_save_failed", "failed to save provider credentials")
+		}
 	}
-	if _, err = a.authStore.SaveAuth(ctx, pluginapi.HostAuthSaveRequest{
-		Name: a.credentialFile,
-		JSON: json.RawMessage(raw),
-	}); err != nil {
-		return jsonError(http.StatusInternalServerError, "credential_save_failed", "failed to save provider credentials")
+	if err = a.waitForAuthConvergence(ctx, keys, savedAt); err != nil {
+		return jsonError(
+			http.StatusGatewayTimeout,
+			"auth_reconcile_timeout",
+			"credential file was saved, but CPA did not finish reconciling the controller and key records before the timeout; the provider remains disabled",
+		)
 	}
 	return jsonResponse(http.StatusOK, map[string]any{"status": "ok", "keys": keyViews(keys)})
+}
+
+func (a *API) waitForAuthConvergence(ctx context.Context, keys []providerauth.Key, updatedAfter time.Time) error {
+	wait := a.authSyncWait
+	if wait <= 0 {
+		wait = defaultAuthSyncWait
+	}
+	poll := a.authSyncPoll
+	if poll <= 0 {
+		poll = defaultAuthSyncPoll
+	}
+	expected := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		expected[a.credentialFile+"#"+key.ID] = key.Disabled
+	}
+
+	deadline := time.NewTimer(wait)
+	defer deadline.Stop()
+	var lastErr error
+	for {
+		entries, err := a.authStore.ListAuth(ctx)
+		if err == nil {
+			if authEntriesConverged(entries, a.credentialFile, expected, updatedAfter) {
+				return nil
+			}
+		} else {
+			lastErr = err
+		}
+
+		timer := time.NewTimer(poll)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-deadline.C:
+			timer.Stop()
+			if lastErr != nil {
+				return fmt.Errorf("auth reconciliation timed out after host list error: %w", lastErr)
+			}
+			return errors.New("auth reconciliation timed out")
+		case <-timer.C:
+		}
+	}
+}
+
+func authEntriesConverged(entries []pluginapi.HostAuthFileEntry, credentialFile string, expected map[string]bool, updatedAfter time.Time) bool {
+	controllerReady := false
+	found := make(map[string]struct{}, len(expected))
+	prefix := credentialFile + "#"
+	for _, entry := range entries {
+		id := strings.TrimSpace(entry.ID)
+		if id == credentialFile {
+			controllerReady = entry.Disabled && authEntryFreshEnough(entry, updatedAfter)
+			continue
+		}
+		if !strings.HasPrefix(id, prefix) {
+			continue
+		}
+		disabled, ok := expected[id]
+		if !ok {
+			return false
+		}
+		if entry.Disabled != disabled || !authEntryFreshEnough(entry, updatedAfter) {
+			continue
+		}
+		found[id] = struct{}{}
+	}
+	return controllerReady && len(found) == len(expected)
+}
+
+func authEntryFreshEnough(entry pluginapi.HostAuthFileEntry, updatedAfter time.Time) bool {
+	if updatedAfter.IsZero() {
+		return true
+	}
+	return !entry.UpdatedAt.IsZero() && !entry.UpdatedAt.Before(updatedAfter)
+}
+
+type discoverModelsInput struct {
+	Config config.Config `json:"config"`
+	Key    editableKey   `json:"key"`
+}
+
+type discoveredModel struct {
+	Name        string `json:"name"`
+	DisplayName string `json:"display-name,omitempty"`
+}
+
+func (a *API) discoverModels(ctx context.Context, body []byte) pluginapi.ManagementResponse {
+	var input discoverModelsInput
+	if err := decodeJSON(body, &input); err != nil {
+		return jsonError(http.StatusBadRequest, "invalid_body", err.Error())
+	}
+	input.Config.Normalize()
+	if err := input.Config.Validate(); err != nil {
+		return jsonError(http.StatusBadRequest, "invalid_config", err.Error())
+	}
+	if input.Config.BaseURL == "" {
+		return jsonError(http.StatusBadRequest, "base_url_required", "base-url is required for model discovery")
+	}
+	key, failure, ok := a.resolveDraftKey(ctx, input.Config, input.Key, "model discovery")
+	if !ok {
+		return failure
+	}
+	clientFactory := a.httpClients
+	if clientFactory == nil {
+		clientFactory = executor.NewHTTPClient
+	}
+	client, errClient := clientFactory(key.ProxyURL)
+	if errClient != nil {
+		return jsonError(http.StatusBadRequest, "invalid_proxy", "failed to create the configured proxy transport")
+	}
+
+	headers := http.Header{
+		"Accept":     []string{"application/json"},
+		"User-Agent": []string{"cpa-plugin-" + provider.ID},
+	}
+	applyDiscoveryAuthentication(headers, input.Config.Protocol, key.APIKey)
+	for name, value := range input.Config.Headers {
+		if strings.TrimSpace(name) != "" {
+			headers.Set(name, value)
+		}
+	}
+	response, err := client.Do(ctx, pluginapi.HTTPRequest{
+		Method:  http.MethodGet,
+		URL:     input.Config.BaseURL + "/models",
+		Headers: headers,
+	})
+	if err != nil {
+		if errors.Is(err, executor.ErrResponseBodyTooLarge) {
+			return jsonError(http.StatusBadGateway, "model_response_too_large", "model discovery response is too large")
+		}
+		message := redactDiscoveryError(err.Error(), key, input.Config.Headers)
+		if strings.TrimSpace(message) == "" {
+			message = "model discovery request failed"
+		}
+		return jsonError(http.StatusBadGateway, "model_discovery_failed", message)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return jsonError(
+			http.StatusBadGateway,
+			"model_discovery_failed",
+			fmt.Sprintf("model discovery returned HTTP %d", response.StatusCode),
+		)
+	}
+	if len(response.Body) > maxModelResponseBody {
+		return jsonError(http.StatusBadGateway, "model_response_too_large", "model discovery response is too large")
+	}
+	models, err := parseDiscoveredModels(input.Config.Protocol, response.Body)
+	if err != nil {
+		return jsonError(http.StatusBadGateway, "invalid_model_response", "model discovery returned an unsupported response")
+	}
+	return jsonResponse(http.StatusOK, map[string]any{"models": models})
+}
+
+func applyDiscoveryAuthentication(headers http.Header, protocol config.Protocol, apiKey string) {
+	if protocol == config.ProtocolAnthropic {
+		headers.Set("X-Api-Key", apiKey)
+		headers.Set("Anthropic-Version", "2023-06-01")
+		return
+	}
+	if protocol == config.ProtocolGemini {
+		headers.Set("X-Goog-Api-Key", apiKey)
+		return
+	}
+	headers.Set("Authorization", "Bearer "+apiKey)
+}
+
+func parseDiscoveredModels(protocol config.Protocol, body []byte) ([]discoveredModel, error) {
+	models := make([]discoveredModel, 0)
+	seen := make(map[string]struct{})
+	appendModel := func(name, displayName string) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		if _, exists := seen[name]; exists {
+			return
+		}
+		seen[name] = struct{}{}
+		models = append(models, discoveredModel{Name: name, DisplayName: strings.TrimSpace(displayName)})
+	}
+
+	if protocol == config.ProtocolGemini {
+		var payload struct {
+			Models []struct {
+				Name                       string   `json:"name"`
+				DisplayName                string   `json:"displayName"`
+				SupportedGenerationMethods []string `json:"supportedGenerationMethods"`
+			} `json:"models"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil || payload.Models == nil {
+			return nil, errors.New("invalid Gemini models response")
+		}
+		for _, model := range payload.Models {
+			if len(model.SupportedGenerationMethods) > 0 && !containsFold(model.SupportedGenerationMethods, "generateContent") {
+				continue
+			}
+			appendModel(strings.TrimPrefix(strings.TrimSpace(model.Name), "models/"), model.DisplayName)
+		}
+		return models, nil
+	}
+
+	var payload struct {
+		Data []struct {
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			DisplayName string `json:"display_name"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil || payload.Data == nil {
+		return nil, errors.New("invalid OpenAI-compatible models response")
+	}
+	for _, model := range payload.Data {
+		displayName := model.DisplayName
+		if displayName == "" {
+			displayName = model.Name
+		}
+		appendModel(model.ID, displayName)
+	}
+	return models, nil
+}
+
+func containsFold(values []string, target string) bool {
+	for _, value := range values {
+		if strings.EqualFold(strings.TrimSpace(value), target) {
+			return true
+		}
+	}
+	return false
+}
+
+func redactDiscoveryError(message string, key providerauth.Key, headers map[string]string) string {
+	message = redactSecret(message, key.APIKey)
+	message = redactSecret(message, key.ProxyURL)
+	for _, value := range headers {
+		message = redactSecret(message, value)
+	}
+	return message
 }
 
 type testConnectionInput struct {
@@ -300,44 +584,9 @@ func (a *API) testConnection(ctx context.Context, body []byte) pluginapi.Managem
 	if model.Image {
 		return jsonError(http.StatusBadRequest, "image_model_not_testable", "image models cannot be used by the connection test")
 	}
-	key := input.Key.authKey()
-	usesStoredCredential := strings.TrimSpace(key.APIKey) == "" || input.Key.PreserveProxyURL
-	if usesStoredCredential && !sameCredentialDestination(a.config, input.Config) {
-		return jsonError(http.StatusBadRequest, "credential_reentry_required", "re-enter the API key and proxy URL when testing a changed provider destination")
-	}
-	if usesStoredCredential {
-		credential, err := a.loadCredential(ctx)
-		if err != nil {
-			return jsonError(http.StatusInternalServerError, "credential_read_failed", "failed to read provider credentials")
-		}
-		if credential.Destination == nil || !credential.Destination.MatchesConfig(input.Config) {
-			return jsonError(http.StatusBadRequest, "credential_reentry_required", "re-enter the API key and proxy URL because the stored credential belongs to a different provider destination")
-		}
-		found := false
-		for _, stored := range credential.Keys {
-			if stored.ID == key.ID {
-				found = true
-				if strings.TrimSpace(key.APIKey) == "" {
-					key.APIKey = stored.APIKey
-				}
-				if input.Key.PreserveProxyURL {
-					key.ProxyURL = stored.ProxyURL
-				}
-				break
-			}
-		}
-		if input.Key.PreserveProxyURL && !found {
-			return jsonError(http.StatusBadRequest, "invalid_key", "preserve-proxy-url requires an existing key")
-		}
-	}
-	if strings.TrimSpace(key.APIKey) == "" {
-		return jsonError(http.StatusBadRequest, "missing_secret", "an API key is required for the connection test")
-	}
-	if err := validateEditableKey(key, 0); err != nil {
-		return jsonError(http.StatusBadRequest, "invalid_key", err.Error())
-	}
-	if strings.TrimSpace(key.ProxyURL) != "" {
-		return jsonError(http.StatusUnprocessableEntity, "proxy_test_unsupported", "connection testing cannot safely exercise a per-key proxy; save the key and verify it through a normal model request")
+	key, failure, ok := a.resolveDraftKey(ctx, input.Config, input.Key, "connection test")
+	if !ok {
+		return failure
 	}
 	started := time.Now()
 	result, err := a.tester.TestConnection(ctx, TestRequest{
@@ -364,6 +613,55 @@ func (a *API) testConnection(ctx context.Context, body []byte) pluginapi.Managem
 		result.Model = input.Model
 	}
 	return jsonResponse(http.StatusOK, result)
+}
+
+func (a *API) resolveDraftKey(ctx context.Context, draftConfig config.Config, draft editableKey, operation string) (providerauth.Key, pluginapi.ManagementResponse, bool) {
+	key := draft.authKey()
+	usesStoredCredential := strings.TrimSpace(key.APIKey) == "" || draft.PreserveProxyURL
+	if usesStoredCredential && !sameCredentialDestination(a.config, draftConfig) {
+		return providerauth.Key{}, jsonError(
+			http.StatusBadRequest,
+			"credential_reentry_required",
+			"re-enter the API key and proxy URL when using a changed provider destination for "+operation,
+		), false
+	}
+	if usesStoredCredential {
+		credential, err := a.loadCredential(ctx)
+		if err != nil {
+			return providerauth.Key{}, jsonError(http.StatusInternalServerError, "credential_read_failed", "failed to read provider credentials"), false
+		}
+		if credential.Destination == nil || !credential.Destination.MatchesConfig(draftConfig) {
+			return providerauth.Key{}, jsonError(
+				http.StatusBadRequest,
+				"credential_reentry_required",
+				"re-enter the API key and proxy URL because the stored credential belongs to a different provider destination",
+			), false
+		}
+		found := false
+		for _, stored := range credential.Keys {
+			if stored.ID != key.ID {
+				continue
+			}
+			found = true
+			if strings.TrimSpace(key.APIKey) == "" {
+				key.APIKey = stored.APIKey
+			}
+			if draft.PreserveProxyURL {
+				key.ProxyURL = stored.ProxyURL
+			}
+			break
+		}
+		if draft.PreserveProxyURL && !found {
+			return providerauth.Key{}, jsonError(http.StatusBadRequest, "invalid_key", "preserve-proxy-url requires an existing key"), false
+		}
+	}
+	if strings.TrimSpace(key.APIKey) == "" {
+		return providerauth.Key{}, jsonError(http.StatusBadRequest, "missing_secret", "an API key is required for "+operation), false
+	}
+	if err := validateEditableKey(key, 0); err != nil {
+		return providerauth.Key{}, jsonError(http.StatusBadRequest, "invalid_key", err.Error()), false
+	}
+	return key, pluginapi.ManagementResponse{}, true
 }
 
 func viewKey(key providerauth.Key) keyView {

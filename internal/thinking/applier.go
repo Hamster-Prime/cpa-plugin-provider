@@ -2,6 +2,8 @@ package thinking
 
 import (
 	"context"
+	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/Hamster-Prime/cpa-plugin-provider/internal/config"
@@ -24,6 +26,26 @@ func NewApplier(cfg config.Config) *Applier {
 }
 
 func (a *Applier) Identifier() string { return provider.ID }
+
+// ApplyRequestedModel applies the canonical CPA thinking suffix carried by the
+// original requested model. Stock hosts may not invoke plugin thinking appliers,
+// so the executor uses this as a request-local compatibility path.
+func ApplyRequestedModel(ctx context.Context, protocol config.Protocol, body []byte, requestedModel string, model pluginapi.ModelInfo) ([]byte, error) {
+	cfg, hasSuffix, err := thinkingConfigFromSuffix(requestedModel, model.Thinking, protocol)
+	if err != nil || !hasSuffix {
+		return append([]byte(nil), body...), err
+	}
+	returnBody, errApply := (&Applier{protocol: protocol}).ApplyThinking(ctx, pluginapi.ThinkingApplyRequest{
+		Provider: provider.ID,
+		Model:    model,
+		Config:   cfg,
+		Body:     body,
+	})
+	if errApply != nil {
+		return append([]byte(nil), body...), errApply
+	}
+	return returnBody.Body, nil
+}
 
 func (a *Applier) ApplyThinking(_ context.Context, req pluginapi.ThinkingApplyRequest) (pluginapi.PayloadResponse, error) {
 	body := append([]byte(nil), req.Body...)
@@ -60,6 +82,153 @@ func normalize(cfg pluginapi.ThinkingConfig) pluginapi.ThinkingConfig {
 		cfg.Mode = "none"
 	}
 	return cfg
+}
+
+func thinkingConfigFromSuffix(requestedModel string, support *pluginapi.ThinkingSupport, protocol config.Protocol) (pluginapi.ThinkingConfig, bool, error) {
+	open := strings.LastIndex(requestedModel, "(")
+	if open <= 0 || !strings.HasSuffix(requestedModel, ")") {
+		return pluginapi.ThinkingConfig{}, false, nil
+	}
+	suffix := strings.ToLower(requestedModel[open+1 : len(requestedModel)-1])
+	var cfg pluginapi.ThinkingConfig
+	switch suffix {
+	case "none":
+		cfg.Mode = "none"
+	case "auto", "-1":
+		cfg.Mode = "auto"
+	case "minimal", "low", "medium", "high", "xhigh", "max":
+		cfg.Mode, cfg.Level = "level", suffix
+	default:
+		budget, err := strconv.Atoi(suffix)
+		if err != nil || budget < 0 {
+			return pluginapi.ThinkingConfig{}, false, nil
+		}
+		if budget == 0 {
+			cfg.Mode = "none"
+		} else {
+			cfg.Mode, cfg.Budget = "budget", budget
+		}
+	}
+	if support == nil {
+		return pluginapi.ThinkingConfig{}, true, fmt.Errorf("model %q does not support thinking", requestedModel[:open])
+	}
+	return normalizeSuffixConfig(cfg, support, protocol)
+}
+
+func normalizeSuffixConfig(cfg pluginapi.ThinkingConfig, support *pluginapi.ThinkingSupport, protocol config.Protocol) (pluginapi.ThinkingConfig, bool, error) {
+	hasBudget := support.Min > 0 || support.Max > 0
+	hasLevels := len(support.Levels) > 0
+	switch cfg.Mode {
+	case "level":
+		if hasLevels {
+			if !hasThinkingLevel(support.Levels, cfg.Level) {
+				return pluginapi.ThinkingConfig{}, true, fmt.Errorf("thinking level %q is not supported", cfg.Level)
+			}
+			return cfg, true, nil
+		}
+		if hasBudget {
+			budget, ok := levelToBudget(cfg.Level)
+			if !ok {
+				return pluginapi.ThinkingConfig{}, true, fmt.Errorf("unknown thinking level %q", cfg.Level)
+			}
+			cfg.Mode, cfg.Level, cfg.Budget = "budget", "", clampSuffixBudget(budget, support)
+		}
+	case "budget":
+		if hasLevels && !hasBudget {
+			cfg.Mode, cfg.Level, cfg.Budget = "level", nearestThinkingLevel(budgetToLevel(cfg.Budget), support.Levels), 0
+		} else {
+			cfg.Budget = clampSuffixBudget(cfg.Budget, support)
+		}
+	case "auto":
+		if support.DynamicAllowed {
+			return cfg, true, nil
+		}
+		if hasLevels && !hasBudget {
+			cfg.Mode, cfg.Level = "level", support.Levels[len(support.Levels)/2]
+		} else {
+			cfg.Mode = "budget"
+			cfg.Budget = (support.Min + support.Max) / 2
+			if cfg.Budget <= 0 {
+				if support.ZeroAllowed {
+					cfg.Mode = "none"
+				} else {
+					cfg.Budget = support.Min
+				}
+			}
+		}
+	case "none":
+		if protocol == config.ProtocolAnthropic || support.ZeroAllowed || hasThinkingLevel(support.Levels, "none") {
+			return cfg, true, nil
+		}
+		if hasLevels {
+			cfg.Level = strings.ToLower(strings.TrimSpace(support.Levels[0]))
+		} else if hasBudget {
+			cfg.Budget = clampSuffixBudget(0, support)
+		}
+	}
+	return cfg, true, nil
+}
+
+func clampSuffixBudget(value int, support *pluginapi.ThinkingSupport) int {
+	if value == 0 && !support.ZeroAllowed {
+		value = support.Min
+	}
+	if support.Min > 0 && value < support.Min {
+		value = support.Min
+	}
+	if support.Max > 0 && value > support.Max {
+		value = support.Max
+	}
+	return value
+}
+
+func levelToBudget(level string) (int, bool) {
+	values := map[string]int{
+		"none": 0, "auto": -1, "minimal": 512, "low": 1024,
+		"medium": 8192, "high": 24576, "xhigh": 32768, "max": 128000,
+	}
+	value, ok := values[strings.ToLower(strings.TrimSpace(level))]
+	return value, ok
+}
+
+func hasThinkingLevel(levels []string, target string) bool {
+	for _, level := range levels {
+		if strings.EqualFold(strings.TrimSpace(level), target) {
+			return true
+		}
+	}
+	return false
+}
+
+func nearestThinkingLevel(level string, supported []string) string {
+	if len(supported) == 0 || hasThinkingLevel(supported, level) {
+		return level
+	}
+	order := []string{"minimal", "low", "medium", "high", "xhigh", "max"}
+	position := func(value string) int {
+		for index, candidate := range order {
+			if strings.EqualFold(strings.TrimSpace(value), candidate) {
+				return index
+			}
+		}
+		return -1
+	}
+	wanted := position(level)
+	best, distance := strings.ToLower(strings.TrimSpace(supported[0])), len(order)+1
+	for _, candidate := range supported {
+		index := position(candidate)
+		if index < 0 {
+			continue
+		}
+		candidateDistance := index - wanted
+		if candidateDistance < 0 {
+			candidateDistance = -candidateDistance
+		}
+		if candidateDistance < distance {
+			best, distance = order[index], candidateDistance
+		}
+	}
+	return best
 }
 
 func applyEffort(body []byte, path string, cfg pluginapi.ThinkingConfig) []byte {

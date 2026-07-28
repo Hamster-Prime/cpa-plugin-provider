@@ -14,14 +14,11 @@ import (
 	"strings"
 )
 
-const hostPatchArchivePath = "patches/CLIProxyAPI-v7.2.102-plugin-host-security.patch"
-
 var releaseSupportFiles = []string{
 	"README.md",
 	"LICENSE",
 	"THIRD_PARTY_NOTICES.md",
 	"LICENSES/Apache-2.0.txt",
-	hostPatchArchivePath,
 }
 
 type archiveEntry struct {

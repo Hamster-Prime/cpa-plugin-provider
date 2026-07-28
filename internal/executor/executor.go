@@ -2,8 +2,6 @@ package executor
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"net/http"
 	"strings"
 	"unicode/utf8"
@@ -14,12 +12,13 @@ import (
 )
 
 type Executor struct {
-	cfg config.Config
+	cfg         config.Config
+	httpClients hostHTTPClientFactory
 }
 
 func New(cfg config.Config) *Executor {
 	cfg.Normalize()
-	return &Executor{cfg: cfg}
+	return &Executor{cfg: cfg, httpClients: newSafeHTTPClient}
 }
 
 func NewExecutor(cfg config.Config) *Executor { return New(cfg) }
@@ -27,14 +26,15 @@ func NewExecutor(cfg config.Config) *Executor { return New(cfg) }
 func (e *Executor) Identifier() string { return provider.ID }
 
 func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorResponse, error) {
-	built, errBuild := buildModelRequest(e.cfg, req, false, "generate")
+	built, errBuild := buildModelRequest(ctx, e.cfg, req, false, "generate")
 	if errBuild != nil {
 		return pluginapi.ExecutorResponse{}, errBuild
 	}
-	if req.HTTPClient == nil {
-		return pluginapi.ExecutorResponse{}, fmt.Errorf("host HTTP client is required")
+	client, errClient := e.upstreamClient(built.proxyURL)
+	if errClient != nil {
+		return pluginapi.ExecutorResponse{}, errClient
 	}
-	response, errDo := req.HTTPClient.Do(ctx, pluginapi.HTTPRequest{
+	response, errDo := client.Do(ctx, pluginapi.HTTPRequest{
 		Method:  built.method,
 		URL:     built.url,
 		Headers: built.headers,
@@ -46,20 +46,27 @@ func (e *Executor) Execute(ctx context.Context, req pluginapi.ExecutorRequest) (
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return pluginapi.ExecutorResponse{}, newUpstreamStatusError(response.StatusCode, response.Body, built.sensitiveValues...)
 	}
-	payload := rewriteResponseModel(response.Body, built.publicModel, built.forceMapping)
+	payload, errTranslate := translateNonStreamResponse(ctx, e.cfg, req, built, response.Body)
+	if errTranslate != nil {
+		return pluginapi.ExecutorResponse{}, errTranslate
+	}
 	return pluginapi.ExecutorResponse{Payload: payload, Headers: response.Headers}, nil
 }
 
 func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorStreamResponse, error) {
-	built, errBuild := buildModelRequest(e.cfg, req, true, "generate")
+	built, errBuild := buildModelRequest(ctx, e.cfg, req, true, "generate")
 	if errBuild != nil {
 		return pluginapi.ExecutorStreamResponse{}, errBuild
 	}
-	if req.HTTPClient == nil {
-		return pluginapi.ExecutorStreamResponse{}, fmt.Errorf("host HTTP client is required")
+	if errTranslation := validateStreamResponseTranslation(e.cfg, req); errTranslation != nil {
+		return pluginapi.ExecutorStreamResponse{}, errTranslation
+	}
+	client, errClient := e.upstreamClient(built.proxyURL)
+	if errClient != nil {
+		return pluginapi.ExecutorStreamResponse{}, errClient
 	}
 	streamCtx, cancelStream := context.WithCancel(ctx)
-	response, errDo := req.HTTPClient.DoStream(streamCtx, pluginapi.HTTPRequest{
+	response, errDo := client.DoStream(streamCtx, pluginapi.HTTPRequest{
 		Method:  built.method,
 		URL:     built.url,
 		Headers: built.headers,
@@ -74,16 +81,17 @@ func (e *Executor) ExecuteStream(ctx context.Context, req pluginapi.ExecutorRequ
 		cancelStream()
 		return pluginapi.ExecutorStreamResponse{}, newUpstreamStatusError(response.StatusCode, body, built.sensitiveValues...)
 	}
+	nativeChunks := convertHTTPChunksWithClose(
+		streamCtx,
+		response.Chunks,
+		built.publicModel,
+		built.forceMapping,
+		e.cfg.Protocol == config.ProtocolGemini,
+		cancelStream,
+	)
 	return pluginapi.ExecutorStreamResponse{
 		Headers: response.Headers,
-		Chunks: convertHTTPChunksWithClose(
-			streamCtx,
-			response.Chunks,
-			built.publicModel,
-			built.forceMapping,
-			e.cfg.Protocol == config.ProtocolGemini,
-			cancelStream,
-		),
+		Chunks:  translateStreamResponse(ctx, e.cfg, req, built, nativeChunks),
 	}, nil
 }
 
@@ -92,16 +100,17 @@ func (e *Executor) CountTokens(ctx context.Context, req pluginapi.ExecutorReques
 		if _, err := apiKeyFromStorageForConfig(req.StorageJSON, e.cfg); err != nil {
 			return pluginapi.ExecutorResponse{}, err
 		}
-		return localTokenCount(req.Payload, e.cfg.Protocol), nil
+		return localTokenCount(req.Payload, responseFormatForCount(e.cfg, req))
 	}
-	built, errBuild := buildModelRequest(e.cfg, req, false, "countTokens")
+	built, errBuild := buildModelRequest(ctx, e.cfg, req, false, "countTokens")
 	if errBuild != nil {
 		return pluginapi.ExecutorResponse{}, errBuild
 	}
-	if req.HTTPClient == nil {
-		return pluginapi.ExecutorResponse{}, fmt.Errorf("host HTTP client is required")
+	client, errClient := e.upstreamClient(built.proxyURL)
+	if errClient != nil {
+		return pluginapi.ExecutorResponse{}, errClient
 	}
-	response, errDo := req.HTTPClient.Do(ctx, pluginapi.HTTPRequest{
+	response, errDo := client.Do(ctx, pluginapi.HTTPRequest{
 		Method:  built.method,
 		URL:     built.url,
 		Headers: built.headers,
@@ -113,26 +122,34 @@ func (e *Executor) CountTokens(ctx context.Context, req pluginapi.ExecutorReques
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return pluginapi.ExecutorResponse{}, newUpstreamStatusError(response.StatusCode, response.Body, built.sensitiveValues...)
 	}
-	return pluginapi.ExecutorResponse{Payload: response.Body, Headers: response.Headers}, nil
+	count, errCount := tokenCountFromPayload(e.cfg.Protocol, response.Body)
+	if errCount != nil {
+		return pluginapi.ExecutorResponse{}, errCount
+	}
+	payload, errPayload := tokenCountPayload(normalizeResponseFormat(responseFormatForCount(e.cfg, req)), count)
+	if errPayload != nil {
+		return pluginapi.ExecutorResponse{}, errPayload
+	}
+	return pluginapi.ExecutorResponse{Payload: payload, Headers: response.Headers}, nil
 }
 
-func localTokenCount(payload []byte, protocol config.Protocol) pluginapi.ExecutorResponse {
+func localTokenCount(payload []byte, format string) (pluginapi.ExecutorResponse, error) {
 	// Compatibility endpoints rarely expose token counting. This deterministic
 	// estimate keeps the required executor capability usable without another call.
-	count := (utf8.RuneCount(payload) + 3) / 4
-	var body []byte
-	if protocol == config.ProtocolOpenAIResponses {
-		body, _ = json.Marshal(map[string]any{"usage": map[string]int{"input_tokens": count, "output_tokens": 0, "total_tokens": count}})
-	} else {
-		body, _ = json.Marshal(map[string]any{"usage": map[string]int{"prompt_tokens": count, "completion_tokens": 0, "total_tokens": count}})
+	count := int64((utf8.RuneCount(payload) + 3) / 4)
+	body, err := tokenCountPayload(normalizeResponseFormat(format), count)
+	if err != nil {
+		return pluginapi.ExecutorResponse{}, err
 	}
-	return pluginapi.ExecutorResponse{Payload: body}
+	return pluginapi.ExecutorResponse{Payload: body}, nil
+}
+
+func responseFormatForCount(cfg config.Config, req pluginapi.ExecutorRequest) string {
+	_, format := responseFormats(cfg, req)
+	return format.String()
 }
 
 func (e *Executor) HttpRequest(ctx context.Context, req pluginapi.ExecutorHTTPRequest) (pluginapi.ExecutorHTTPResponse, error) {
-	if req.HTTPClient == nil {
-		return pluginapi.ExecutorHTTPResponse{}, fmt.Errorf("host HTTP client is required")
-	}
 	if errURL := validateExecutorURL(e.cfg.BaseURL, req.URL); errURL != nil {
 		return pluginapi.ExecutorHTTPResponse{}, errURL
 	}
@@ -140,9 +157,14 @@ func (e *Executor) HttpRequest(ctx context.Context, req pluginapi.ExecutorHTTPRe
 	if errURL != nil {
 		return pluginapi.ExecutorHTTPResponse{}, errURL
 	}
-	apiKey, errKey := apiKeyFromStorageForConfig(req.StorageJSON, e.cfg)
+	credential, errKey := credentialFromStorageForConfig(req.StorageJSON, e.cfg)
 	if errKey != nil {
 		return pluginapi.ExecutorHTTPResponse{}, errKey
+	}
+	apiKey := credential.apiKey
+	client, errClient := e.upstreamClient(credential.proxyURL)
+	if errClient != nil {
+		return pluginapi.ExecutorHTTPResponse{}, errClient
 	}
 	method := strings.TrimSpace(req.Method)
 	if method == "" {
@@ -158,7 +180,7 @@ func (e *Executor) HttpRequest(ctx context.Context, req pluginapi.ExecutorHTTPRe
 			headers.Set(key, value)
 		}
 	}
-	response, errDo := req.HTTPClient.Do(ctx, pluginapi.HTTPRequest{
+	response, errDo := client.Do(ctx, pluginapi.HTTPRequest{
 		Method:  method,
 		URL:     requestURL,
 		Headers: headers,
@@ -176,4 +198,16 @@ func (e *Executor) HttpRequest(ctx context.Context, req pluginapi.ExecutorHTTPRe
 		Headers:    response.Headers,
 		Body:       body,
 	}, nil
+}
+
+func (e *Executor) upstreamClient(proxyURL string) (pluginapi.HostHTTPClient, error) {
+	factory := e.httpClients
+	if factory == nil {
+		factory = newSafeHTTPClient
+	}
+	client, err := factory(proxyURL)
+	if err != nil {
+		return nil, statusError{statusCode: http.StatusServiceUnavailable, body: []byte("provider proxy configuration is invalid")}
+	}
+	return client, nil
 }

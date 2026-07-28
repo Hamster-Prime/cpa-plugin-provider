@@ -26,15 +26,24 @@ func TestParseAuthExpandsKeysWithoutLeakingSecrets(t *testing.T) {
 			{"id":"backup","api_key":"sk-backup-secret","priority":-3,"disabled":true}
 		]
 	}`)
-	resp, err := p.ParseAuth(context.Background(), pluginapi.AuthParseRequest{RawJSON: raw, FileName: "provider.json"})
+	resp, err := p.ParseAuth(context.Background(), pluginapi.AuthParseRequest{
+		RawJSON: raw, FileName: "provider.json",
+		Host: pluginapi.HostConfigSummary{ProxyURL: "socks5://global-proxy.example:1080"},
+	})
 	if err != nil {
 		t.Fatalf("ParseAuth() error = %v", err)
 	}
-	if !resp.Handled || len(resp.Auths) != 2 {
-		t.Fatalf("ParseAuth() handled=%v auths=%d, want true/2", resp.Handled, len(resp.Auths))
+	if !resp.Handled || len(resp.Auths) != 3 {
+		t.Fatalf("ParseAuth() handled=%v auths=%d, want true/3", resp.Handled, len(resp.Auths))
 	}
 
-	primary, backup := resp.Auths[0], resp.Auths[1]
+	controller, primary, backup := resp.Auths[0], resp.Auths[1], resp.Auths[2]
+	if controller.ID != "provider.json" || controller.FileName != "provider.json" || !controller.Disabled || controller.Metadata["controller"] != true {
+		t.Fatalf("controller = %#v", controller)
+	}
+	if strings.Contains(string(controller.StorageJSON), "api-key") || strings.Contains(string(controller.StorageJSON), "sk-") {
+		t.Fatalf("controller storage contains a secret: %s", controller.StorageJSON)
+	}
 	if primary.Provider != providerinfo.ID || primary.ID != "provider.json#primary" || primary.Label != "Main" {
 		t.Fatalf("primary identity = %#v", primary)
 	}
@@ -57,7 +66,7 @@ func TestParseAuthExpandsKeysWithoutLeakingSecrets(t *testing.T) {
 		RawJSON:  []byte(`{"type":"multi-protocol-provider","keys":[{"id":"backup","api-key":"b"},{"id":"primary","api-key":"p"}]}`),
 		FileName: "provider.json",
 	})
-	if err != nil || len(reordered.Auths) != 2 || reordered.Auths[0].ID != backup.ID || reordered.Auths[1].ID != primary.ID {
+	if err != nil || len(reordered.Auths) != 3 || reordered.Auths[0].ID != controller.ID || reordered.Auths[1].ID != backup.ID || reordered.Auths[2].ID != primary.ID {
 		t.Fatalf("reordered auth identities = %#v, error = %v", reordered.Auths, err)
 	}
 
@@ -82,6 +91,9 @@ func TestParseAuthExpandsKeysWithoutLeakingSecrets(t *testing.T) {
 	if !strings.Contains(string(primary.StorageJSON), `"protocol":"anthropic-messages"`) ||
 		!strings.Contains(string(primary.StorageJSON), `"base-url":"https://api.example.com/v1"`) {
 		t.Fatalf("StorageJSON does not retain normalized credential destination: %s", primary.StorageJSON)
+	}
+	if !strings.Contains(string(primary.StorageJSON), `"host-proxy-url":"socks5://global-proxy.example:1080"`) {
+		t.Fatalf("StorageJSON does not retain the host proxy fallback: %s", primary.StorageJSON)
 	}
 }
 
@@ -111,7 +123,7 @@ func TestProviderDisabledDoesNotPersistOnUsableKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseAuth() error = %v", err)
 	}
-	if len(resp.Auths) != 1 || resp.Auths[0].Disabled {
+	if len(resp.Auths) != 2 || resp.Auths[0].Metadata["controller"] != true || !resp.Auths[0].Disabled || resp.Auths[1].Disabled {
 		t.Fatalf("provider-level disabled leaked into auth = %#v", resp.Auths)
 	}
 }
@@ -161,10 +173,13 @@ func TestCredentialFileCompatibilityAndValidation(t *testing.T) {
 	}
 }
 
-func TestDisplayProxyURLRedactsUserInfoOnly(t *testing.T) {
+func TestDisplayProxyURLRedactsAllNonOriginComponents(t *testing.T) {
 	display, secret := DisplayProxyURL("http://proxy-user:proxy-password@proxy.example:8080/path?q=secret")
 	if !secret || display != "http://redacted@proxy.example:8080" {
 		t.Fatalf("DisplayProxyURL() = %q, %v", display, secret)
+	}
+	if display, secret = DisplayProxyURL("http://proxy.example:8080/token-path?q=secret"); !secret || display != "http://proxy.example:8080" {
+		t.Fatalf("DisplayProxyURL(path/query) = %q, %v", display, secret)
 	}
 	if display, secret = DisplayProxyURL("socks5://proxy.example:1080"); secret || display != "socks5://proxy.example:1080" {
 		t.Fatalf("DisplayProxyURL(no auth) = %q, %v", display, secret)
@@ -178,8 +193,9 @@ func TestRefreshAuthReturnsSameAPIKeyAndRoutingMetadata(t *testing.T) {
 	p := NewProvider(config.Config{Name: "Acme", Priority: 5, DisableCooling: true})
 	resp, err := p.RefreshAuth(context.Background(), pluginapi.AuthRefreshRequest{
 		AuthID:      "provider.json#primary",
-		StorageJSON: []byte(`{"type":"multi-protocol-provider","destination":{"protocol":"gemini","base-url":"https://api.example.com/v1beta"},"id":"primary","api-key":"secret","priority":3}`),
+		StorageJSON: []byte(`{"type":"multi-protocol-provider","destination":{"protocol":"gemini","base-url":"https://api.example.com/v1beta"},"id":"primary","api-key":"secret","host-proxy-url":"http://old-proxy.example:8080","priority":3}`),
 		Attributes:  map[string]string{"runtime_only": "true", "custom": "value"},
+		Host:        pluginapi.HostConfigSummary{AuthDir: "/auth", ProxyURL: "direct"},
 	})
 	if err != nil {
 		t.Fatalf("RefreshAuth() error = %v", err)
@@ -192,6 +208,9 @@ func TestRefreshAuthReturnsSameAPIKeyAndRoutingMetadata(t *testing.T) {
 	}
 	if !strings.Contains(string(resp.Auth.StorageJSON), `"protocol":"gemini"`) || !strings.Contains(string(resp.Auth.StorageJSON), `"base-url":"https://api.example.com/v1beta"`) {
 		t.Fatalf("refreshed storage lost credential destination = %s", resp.Auth.StorageJSON)
+	}
+	if !strings.Contains(string(resp.Auth.StorageJSON), `"host-proxy-url":"direct"`) || strings.Contains(string(resp.Auth.StorageJSON), "old-proxy") {
+		t.Fatalf("refreshed storage did not update the host proxy fallback = %s", resp.Auth.StorageJSON)
 	}
 }
 

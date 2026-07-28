@@ -4,7 +4,7 @@ import "github.com/Hamster-Prime/cpa-plugin-provider/internal/config"
 
 const (
 	ID              = "multi-protocol-provider"
-	Version         = "0.1.0"
+	Version         = "0.2.0"
 	DisplayName     = "Multi-Protocol Provider"
 	Author          = "Hamster-Prime"
 	Repository      = "https://github.com/Hamster-Prime/cpa-plugin-provider"

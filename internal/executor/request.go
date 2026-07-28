@@ -2,6 +2,7 @@ package executor
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	providerauth "github.com/Hamster-Prime/cpa-plugin-provider/internal/auth"
 	"github.com/Hamster-Prime/cpa-plugin-provider/internal/config"
 	"github.com/Hamster-Prime/cpa-plugin-provider/internal/provider"
+	thinkingpkg "github.com/Hamster-Prime/cpa-plugin-provider/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -34,21 +36,32 @@ type builtRequest struct {
 	model           config.Model
 	publicModel     string
 	forceMapping    bool
+	proxyURL        string
 	sensitiveValues []string
 }
 
 type authStorage struct {
-	Type        string                              `json:"type"`
-	Destination *providerauth.CredentialDestination `json:"destination"`
-	APIKey      string                              `json:"api-key"`
-	APIKeyAlt   string                              `json:"api_key"`
-	Key         string                              `json:"key"`
-	Token       string                              `json:"token"`
-	AccessToken string                              `json:"access_token"`
-	Keys        json.RawMessage                     `json:"keys"`
+	Type         string                              `json:"type"`
+	Destination  *providerauth.CredentialDestination `json:"destination"`
+	APIKey       string                              `json:"api-key"`
+	APIKeyAlt    string                              `json:"api_key"`
+	Key          string                              `json:"key"`
+	Token        string                              `json:"token"`
+	AccessToken  string                              `json:"access_token"`
+	Keys         json.RawMessage                     `json:"keys"`
+	ProxyURL     string                              `json:"proxy-url"`
+	ProxyURLAlt  string                              `json:"proxy_url"`
+	HostProxy    string                              `json:"host-proxy-url"`
+	HostProxyAlt string                              `json:"host_proxy_url"`
 }
 
-func buildModelRequest(cfg config.Config, req pluginapi.ExecutorRequest, stream bool, action string) (builtRequest, error) {
+type resolvedCredential struct {
+	apiKey      string
+	destination *providerauth.CredentialDestination
+	proxyURL    string
+}
+
+func buildModelRequest(ctx context.Context, cfg config.Config, req pluginapi.ExecutorRequest, stream bool, action string) (builtRequest, error) {
 	if strings.TrimSpace(cfg.BaseURL) == "" {
 		return builtRequest{}, statusError{statusCode: http.StatusServiceUnavailable, body: []byte("provider base URL is not configured")}
 	}
@@ -56,10 +69,11 @@ func buildModelRequest(cfg config.Config, req pluginapi.ExecutorRequest, stream 
 	if !found {
 		return builtRequest{}, newRequestScopedStatusError(http.StatusBadRequest, []byte(fmt.Sprintf("model %q is not configured", req.Model)))
 	}
-	apiKey, errKey := apiKeyFromStorageForConfig(req.StorageJSON, cfg)
+	credential, errKey := credentialFromStorageForConfig(req.StorageJSON, cfg)
 	if errKey != nil {
 		return builtRequest{}, errKey
 	}
+	apiKey := credential.apiKey
 
 	endpoint, image := requestEndpoint(cfg, req, model, stream, action)
 	if endpoint == "" {
@@ -74,6 +88,13 @@ func buildModelRequest(cfg config.Config, req pluginapi.ExecutorRequest, stream 
 			return builtRequest{}, newRequestScopedStatusError(http.StatusBadRequest, []byte(errPrepare.Error()))
 		}
 	} else {
+		if action == "generate" {
+			var errThinking error
+			body, errThinking = thinkingpkg.ApplyRequestedModel(ctx, cfg.Protocol, body, requestedModel(req), cfg.PluginModel(model))
+			if errThinking != nil {
+				return builtRequest{}, newRequestScopedStatusError(http.StatusBadRequest, []byte(errThinking.Error()))
+			}
+		}
 		var errPrepare error
 		body, errPrepare = prepareJSONPayload(body, model.Name, stream, cfg.Protocol, req.Alt, action)
 		if errPrepare != nil {
@@ -95,8 +116,19 @@ func buildModelRequest(cfg config.Config, req pluginapi.ExecutorRequest, stream 
 		model:           model,
 		publicModel:     publicModelForRequest(cfg, req, model),
 		forceMapping:    model.ForceMapping,
+		proxyURL:        credential.proxyURL,
 		sensitiveValues: upstreamSensitiveValues(apiKey, cfg.Headers),
 	}, nil
+}
+
+func requestedModel(req pluginapi.ExecutorRequest) string {
+	if value, ok := req.Metadata[requestedModelMetaKey].(string); ok && strings.TrimSpace(value) != "" {
+		return strings.TrimSpace(value)
+	}
+	if value, ok := req.Metadata[requestedModelMetaKey].([]byte); ok && strings.TrimSpace(string(value)) != "" {
+		return strings.TrimSpace(string(value))
+	}
+	return strings.TrimSpace(req.Model)
 }
 
 func upstreamSensitiveValues(apiKey string, headers map[string]string) []string {
@@ -403,41 +435,56 @@ func copyHeader(destination, source http.Header, name string) {
 }
 
 func apiKeyFromStorage(raw []byte) (string, error) {
-	key, _, err := credentialFromStorage(raw)
-	return key, err
+	credential, err := credentialFromStorage(raw)
+	return credential.apiKey, err
 }
 
 func apiKeyFromStorageForConfig(raw []byte, cfg config.Config) (string, error) {
-	key, destination, err := credentialFromStorage(raw)
-	if err != nil {
-		return "", err
-	}
-	if destination == nil {
-		return "", statusError{statusCode: http.StatusServiceUnavailable, body: []byte("provider credential is not bound to an upstream destination")}
-	}
-	if !destination.MatchesConfig(cfg) {
-		return "", statusError{statusCode: http.StatusServiceUnavailable, body: []byte("provider credential is bound to a different upstream destination")}
-	}
-	return key, nil
+	credential, err := credentialFromStorageForConfig(raw, cfg)
+	return credential.apiKey, err
 }
 
-func credentialFromStorage(raw []byte) (string, *providerauth.CredentialDestination, error) {
+func credentialFromStorageForConfig(raw []byte, cfg config.Config) (resolvedCredential, error) {
+	credential, err := credentialFromStorage(raw)
+	if err != nil {
+		return resolvedCredential{}, err
+	}
+	if credential.destination == nil {
+		return resolvedCredential{}, statusError{statusCode: http.StatusServiceUnavailable, body: []byte("provider credential is not bound to an upstream destination")}
+	}
+	if !credential.destination.MatchesConfig(cfg) {
+		return resolvedCredential{}, statusError{statusCode: http.StatusServiceUnavailable, body: []byte("provider credential is bound to a different upstream destination")}
+	}
+	return credential, nil
+}
+
+func credentialFromStorage(raw []byte) (resolvedCredential, error) {
 	var storage authStorage
 	if err := json.Unmarshal(raw, &storage); err != nil {
-		return "", nil, statusError{statusCode: http.StatusUnauthorized, body: []byte("invalid provider credential")}
+		return resolvedCredential{}, statusError{statusCode: http.StatusUnauthorized, body: []byte("invalid provider credential")}
 	}
 	if storage.Type != "" && storage.Type != provider.ID {
-		return "", nil, statusError{statusCode: http.StatusUnauthorized, body: []byte("credential belongs to another provider")}
+		return resolvedCredential{}, statusError{statusCode: http.StatusUnauthorized, body: []byte("credential belongs to another provider")}
 	}
 	if len(storage.Keys) > 0 {
-		return "", nil, statusError{statusCode: http.StatusServiceUnavailable, body: []byte("provider credential pool is awaiting CPA auth reconciliation")}
+		return resolvedCredential{}, statusError{statusCode: http.StatusServiceUnavailable, body: []byte("provider credential pool is awaiting CPA auth reconciliation")}
 	}
+	proxyURL := firstStorageValue(storage.ProxyURL, storage.ProxyURLAlt, storage.HostProxy, storage.HostProxyAlt)
 	for _, candidate := range []string{storage.APIKey, storage.APIKeyAlt, storage.Key, storage.Token, storage.AccessToken} {
 		if key := strings.TrimSpace(candidate); key != "" {
-			return key, storage.Destination, nil
+			return resolvedCredential{apiKey: key, destination: storage.Destination, proxyURL: proxyURL}, nil
 		}
 	}
-	return "", nil, statusError{statusCode: http.StatusUnauthorized, body: []byte("provider API key is missing")}
+	return resolvedCredential{}, statusError{statusCode: http.StatusUnauthorized, body: []byte("provider API key is missing")}
+}
+
+func firstStorageValue(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func isImageRequest(req pluginapi.ExecutorRequest) bool {

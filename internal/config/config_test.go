@@ -36,7 +36,7 @@ models:
 func TestProtocolExecutorFormats(t *testing.T) {
 	want := map[Protocol]string{
 		ProtocolOpenAIChat:      "openai",
-		ProtocolOpenAIResponses: "openai-response",
+		ProtocolOpenAIResponses: "codex",
 		ProtocolAnthropic:       "claude",
 		ProtocolGemini:          "gemini",
 	}

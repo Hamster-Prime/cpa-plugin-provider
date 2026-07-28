@@ -1,9 +1,16 @@
 # Third-Party Notices
 
 This distribution contains code from the projects listed below. Versions are
-the versions recorded in `go.mod` and `go.sum` for release 0.1.0.
+the versions recorded in `go.mod` and `go.sum` for release 0.2.0.
 
-## Go standard library
+## Go standard library and Go subrepositories
+
+This BSD-3-Clause license and the patent grant below cover:
+
+* the Go standard library distributed with Go 1.26.5;
+* golang.org/x/crypto v0.54.0;
+* golang.org/x/net v0.57.0; and
+* golang.org/x/sys v0.47.0.
 
 Copyright 2009 The Go Authors.
 
@@ -51,7 +58,7 @@ or contributory patent infringement, or inducement of patent infringement,
 then any patent rights granted to you under this License for this implementation
 of Go shall terminate as of the date such litigation is filed.
 
-## CLIProxyAPI v7.2.102
+## CLIProxyAPI v7.2.103
 
 MIT License
 
@@ -76,7 +83,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-## Tidwall libraries
+## MIT-licensed libraries
 
 The following MIT-licensed modules are included:
 
@@ -84,9 +91,15 @@ The following MIT-licensed modules are included:
 * github.com/tidwall/sjson v1.2.5
 * github.com/tidwall/match v1.1.1
 * github.com/tidwall/pretty v1.2.0
+* github.com/cespare/xxhash/v2 v2.3.0
+* github.com/sirupsen/logrus v1.9.3
+* go.uber.org/atomic v1.11.0
 
 Copyright (c) 2016 Josh Baker
 Copyright (c) 2017 Josh Baker
+Copyright (c) 2016 Caleb Spare
+Copyright (c) 2014 Simon Eskildsen
+Copyright (c) 2016 Uber Technologies, Inc.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of
 this software and associated documentation files (the "Software"), to deal in
@@ -106,9 +119,9 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-## golang.org/x/net v0.57.0
+## github.com/google/uuid v1.6.0
 
-Copyright 2009 The Go Authors.
+Copyright (c) 2009,2014 Google Inc. All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
@@ -118,7 +131,7 @@ modification, are permitted provided that the following conditions are met:
 * Redistributions in binary form must reproduce the above copyright notice,
   this list of conditions and the following disclaimer in the documentation
   and/or other materials provided with the distribution.
-* Neither the name of Google LLC nor the names of its contributors may be used
+* Neither the name of Google Inc. nor the names of its contributors may be used
   to endorse or promote products derived from this software without specific
   prior written permission.
 
@@ -132,6 +145,61 @@ LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
 ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+## github.com/redis/go-redis/v9 v9.19.0
+
+Copyright (c) 2013 The github.com/redis/go-redis Authors.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+## google.golang.org/protobuf v1.34.1
+
+Copyright (c) 2018 The Go Authors. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+* Neither the name of Google Inc. nor the names of its contributors may be used
+  to endorse or promote products derived from this software without specific
+  prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+The "Additional IP Rights Grant (Patents)" reproduced in the Go section above
+also accompanies this module.
 
 ## gopkg.in/yaml.v3 v3.0.1
 

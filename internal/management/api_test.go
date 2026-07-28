@@ -19,18 +19,46 @@ import (
 type fakeAuthStore struct {
 	raw       []byte
 	saveCalls int
+	updatedAt time.Time
 }
 
 func (s *fakeAuthStore) ListAuth(context.Context) ([]pluginapi.HostAuthFileEntry, error) {
 	if len(s.raw) == 0 {
 		return nil, nil
 	}
-	return []pluginapi.HostAuthFileEntry{{
+	return fakeAuthEntriesAt(s.raw, s.updatedAt), nil
+}
+
+func fakeAuthEntries(raw []byte) []pluginapi.HostAuthFileEntry {
+	return fakeAuthEntriesAt(raw, time.Time{})
+}
+
+func fakeAuthEntriesAt(raw []byte, updatedAt time.Time) []pluginapi.HostAuthFileEntry {
+	entries := []pluginapi.HostAuthFileEntry{{
+		ID:        provider.CredentialsFile,
 		AuthIndex: "auth-index-1",
 		Name:      provider.CredentialsFile,
 		Type:      provider.ID,
 		Provider:  provider.ID,
-	}}, nil
+		Disabled:  true,
+		UpdatedAt: updatedAt,
+	}}
+	credential, handled, err := providerauth.ParseCredentialFile(raw)
+	if err != nil || !handled {
+		return entries
+	}
+	for _, key := range credential.Keys {
+		entries = append(entries, pluginapi.HostAuthFileEntry{
+			ID:        provider.CredentialsFile + "#" + key.ID,
+			AuthIndex: "auth-index-" + key.ID,
+			Name:      provider.CredentialsFile,
+			Type:      provider.ID,
+			Provider:  provider.ID,
+			Disabled:  key.Disabled,
+			UpdatedAt: updatedAt,
+		})
+	}
+	return entries
 }
 
 func (s *fakeAuthStore) GetAuth(_ context.Context, req pluginapi.HostAuthGetRequest) (pluginapi.HostAuthGetResponse, error) {
@@ -43,6 +71,7 @@ func (s *fakeAuthStore) GetAuth(_ context.Context, req pluginapi.HostAuthGetRequ
 func (s *fakeAuthStore) SaveAuth(_ context.Context, req pluginapi.HostAuthSaveRequest) (pluginapi.HostAuthSaveResponse, error) {
 	s.saveCalls++
 	s.raw = append([]byte(nil), req.JSON...)
+	s.updatedAt = time.Now().UTC()
 	return pluginapi.HostAuthSaveResponse{Name: req.Name, Path: "/auth/" + req.Name}, nil
 }
 
@@ -51,6 +80,23 @@ type fakeTester struct {
 	result  TestResult
 	err     error
 	calls   int
+}
+
+type fakeHTTPClient struct {
+	request  pluginapi.HTTPRequest
+	response pluginapi.HTTPResponse
+	err      error
+	calls    int
+}
+
+func (c *fakeHTTPClient) Do(_ context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+	c.calls++
+	c.request = req
+	return c.response, c.err
+}
+
+func (c *fakeHTTPClient) DoStream(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPStreamResponse, error) {
+	return pluginapi.HTTPStreamResponse{}, errors.New("streaming is not supported by this test client")
 }
 
 func disabledConfig() config.Config {
@@ -95,8 +141,8 @@ func TestRegisterManagementDeclaresAuthenticatedAndResourceRoutes(t *testing.T) 
 	if err != nil {
 		t.Fatalf("RegisterManagement() error = %v", err)
 	}
-	if len(registration.Routes) != 3 || len(registration.Resources) != 1 {
-		t.Fatalf("registration = %#v, want three routes and one resource", registration)
+	if len(registration.Routes) != 5 || len(registration.Resources) != 1 {
+		t.Fatalf("registration = %#v, want five routes and one resource", registration)
 	}
 	for _, route := range registration.Routes {
 		if route.Menu != "" || route.Handler != api {
@@ -132,6 +178,76 @@ func TestResourceIsStaticAndContainsNoRuntimeConfiguration(t *testing.T) {
 	}
 	if got := resp.Headers.Get("Content-Security-Policy"); !stringsContain(got, "frame-ancestors 'self'") {
 		t.Fatalf("Content-Security-Policy = %q", got)
+	}
+	for _, fragment := range []string{
+		"id=\"discover-models\"", "`${API}/validate`", "`${API}/models`", "beforeunload", "waitUntilConfigMatches",
+		"method: 'PUT'", "headers: Object.keys(config.headers || {}).length ? config.headers : null", "pointer-events: none",
+	} {
+		if !bytes.Contains(resp.Body, []byte(fragment)) {
+			t.Fatalf("resource shell is missing %q", fragment)
+		}
+	}
+	for _, forbidden := range []string{"sessionStorage", "localStorage", "setTimeout(load"} {
+		if bytes.Contains(resp.Body, []byte(forbidden)) {
+			t.Fatalf("resource shell contains forbidden client persistence/race pattern %q", forbidden)
+		}
+	}
+}
+
+func TestValidateConfigNormalizesDraft(t *testing.T) {
+	t.Parallel()
+	api := New(provider.ID, provider.CredentialsFile, config.Default(), nil, nil)
+	resp, _ := api.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+		Method: http.MethodPost,
+		Path:   "/v0/management/plugins/" + provider.ID + "/validate",
+		Body:   []byte(`{"config":{"name":"  Draft Provider  ","protocol":"GEMINI","base-url":"https://api.example.com/v1/","prefix":"/team/","models":[{"name":" model-one "}]}}`),
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, resp.Body)
+	}
+	var body struct {
+		Config config.Config `json:"config"`
+	}
+	decodeResponse(t, resp, &body)
+	if body.Config.Name != "Draft Provider" || body.Config.Protocol != config.ProtocolGemini || body.Config.BaseURL != "https://api.example.com/v1" || body.Config.Prefix != "team" {
+		t.Fatalf("normalized config = %#v", body.Config)
+	}
+	if len(body.Config.Models) != 1 || body.Config.Models[0].Name != "model-one" {
+		t.Fatalf("normalized models = %#v", body.Config.Models)
+	}
+}
+
+func TestValidateConfigPreservesExplicitZeroValuesForHostPatch(t *testing.T) {
+	t.Parallel()
+	api := New(provider.ID, provider.CredentialsFile, config.Default(), nil, nil)
+	resp, _ := api.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+		Method: http.MethodPost,
+		Path:   "/v0/management/plugins/" + provider.ID + "/validate",
+		Body:   []byte(`{"config":{"name":"Provider","priority":0,"protocol":"openai-chat-completions","base-url":"https://api.example.com/v1","prefix":"","disabled":false,"disable-cooling":false,"headers":{},"models":[],"test-model":""}}`),
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, resp.Body)
+	}
+	for _, fragment := range []string{
+		`"priority":0`, `"prefix":""`, `"disabled":false`, `"disable-cooling":false`,
+		`"headers":{}`, `"models":[]`, `"test-model":""`,
+	} {
+		if !bytes.Contains(resp.Body, []byte(fragment)) {
+			t.Fatalf("validated config omitted %s: %s", fragment, resp.Body)
+		}
+	}
+}
+
+func TestValidateConfigRejectsInvalidThinkingRange(t *testing.T) {
+	t.Parallel()
+	api := New(provider.ID, provider.CredentialsFile, config.Default(), nil, nil)
+	resp, _ := api.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+		Method: http.MethodPost,
+		Path:   "/v0/management/plugins/" + provider.ID + "/validate",
+		Body:   []byte(`{"config":{"protocol":"openai-chat-completions","base-url":"https://api.example.com/v1","models":[{"name":"model-one","thinking":{"min":20,"max":10}}]}}`),
+	})
+	if resp.StatusCode != http.StatusBadRequest || !bytes.Contains(resp.Body, []byte("invalid_config")) {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, resp.Body)
 	}
 }
 
@@ -450,9 +566,160 @@ func TestSaveKeysRejectsCredentialChangesWhileProviderIsEnabled(t *testing.T) {
 	}
 }
 
+type delayedAuthStore struct {
+	fakeAuthStore
+	staleRaw           []byte
+	staleUpdatedAt     time.Time
+	postSaveListCalls  int
+	convergeAfterPolls int
+	neverConverge      bool
+	saved              bool
+}
+
+func (s *delayedAuthStore) ListAuth(ctx context.Context) ([]pluginapi.HostAuthFileEntry, error) {
+	if !s.saved {
+		return s.fakeAuthStore.ListAuth(ctx)
+	}
+	s.postSaveListCalls++
+	if s.neverConverge || s.postSaveListCalls <= s.convergeAfterPolls {
+		if len(s.staleRaw) == 0 {
+			return nil, nil
+		}
+		return fakeAuthEntriesAt(s.staleRaw, s.staleUpdatedAt), nil
+	}
+	return s.fakeAuthStore.ListAuth(ctx)
+}
+
+func (s *delayedAuthStore) SaveAuth(ctx context.Context, req pluginapi.HostAuthSaveRequest) (pluginapi.HostAuthSaveResponse, error) {
+	s.staleRaw = append([]byte(nil), s.raw...)
+	s.staleUpdatedAt = s.updatedAt
+	response, err := s.fakeAuthStore.SaveAuth(ctx, req)
+	s.saved = err == nil
+	return response, err
+}
+
+func TestSaveKeysWaitsForExactAuthConvergence(t *testing.T) {
+	store := &delayedAuthStore{
+		fakeAuthStore:      fakeAuthStore{raw: mustCredential(t, []providerauth.Key{{ID: "deleted", APIKey: "sk-old"}})},
+		convergeAfterPolls: 2,
+	}
+	api := New(provider.ID, provider.CredentialsFile, disabledConfig(), store, nil)
+	api.authSyncWait = time.Second
+	api.authSyncPoll = time.Millisecond
+	resp, _ := api.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+		Method: http.MethodPut,
+		Path:   "/v0/management/plugins/" + provider.ID + "/keys",
+		Body:   sameDestinationBody(t, `{"keys":[{"id":"current","api-key":"sk-current","disabled":true}]}`),
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, resp.Body)
+	}
+	if store.postSaveListCalls < 3 {
+		t.Fatalf("post-save list calls = %d, want at least 3", store.postSaveListCalls)
+	}
+}
+
+func TestSaveKeysWaitsForFreshSameIDKeyUpdate(t *testing.T) {
+	oldTime := time.Now().Add(-time.Hour).UTC()
+	store := &delayedAuthStore{
+		fakeAuthStore: fakeAuthStore{
+			raw:       mustCredential(t, []providerauth.Key{{ID: "current", APIKey: "sk-old"}}),
+			updatedAt: oldTime,
+		},
+		convergeAfterPolls: 2,
+	}
+	api := New(provider.ID, provider.CredentialsFile, disabledConfig(), store, nil)
+	api.authSyncWait = time.Second
+	api.authSyncPoll = time.Millisecond
+	resp, _ := api.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+		Method: http.MethodPut,
+		Path:   "/v0/management/plugins/" + provider.ID + "/keys",
+		Body:   sameDestinationBody(t, `{"keys":[{"id":"current","api-key":"sk-new"}]}`),
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, resp.Body)
+	}
+	if store.postSaveListCalls < 3 {
+		t.Fatalf("post-save list calls = %d, want at least 3 for a fresh same-ID record", store.postSaveListCalls)
+	}
+}
+
+func TestAuthEntriesConvergedRequiresDisabledControllerAndExactKeySet(t *testing.T) {
+	t.Parallel()
+	expected := map[string]bool{
+		provider.CredentialsFile + "#primary": false,
+	}
+	ready := []pluginapi.HostAuthFileEntry{
+		{ID: provider.CredentialsFile, Disabled: true},
+		{ID: provider.CredentialsFile + "#primary"},
+		{ID: "unrelated.json#other"},
+	}
+	if !authEntriesConverged(ready, provider.CredentialsFile, expected, time.Time{}) {
+		t.Fatal("exact controller/key state did not converge")
+	}
+	for name, entries := range map[string][]pluginapi.HostAuthFileEntry{
+		"enabled controller": {
+			{ID: provider.CredentialsFile, Disabled: false},
+			{ID: provider.CredentialsFile + "#primary"},
+		},
+		"missing key": {
+			{ID: provider.CredentialsFile, Disabled: true},
+		},
+		"wrong key disabled state": {
+			{ID: provider.CredentialsFile, Disabled: true},
+			{ID: provider.CredentialsFile + "#primary", Disabled: true},
+		},
+		"stale key": {
+			{ID: provider.CredentialsFile, Disabled: true},
+			{ID: provider.CredentialsFile + "#primary"},
+			{ID: provider.CredentialsFile + "#deleted"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if authEntriesConverged(entries, provider.CredentialsFile, expected, time.Time{}) {
+				t.Fatalf("entries unexpectedly converged: %#v", entries)
+			}
+		})
+	}
+	freshCutoff := time.Now().UTC()
+	stale := []pluginapi.HostAuthFileEntry{
+		{ID: provider.CredentialsFile, Disabled: true, UpdatedAt: freshCutoff.Add(-time.Second)},
+		{ID: provider.CredentialsFile + "#primary", UpdatedAt: freshCutoff.Add(-time.Second)},
+	}
+	if authEntriesConverged(stale, provider.CredentialsFile, expected, freshCutoff) {
+		t.Fatal("stale same-ID records unexpectedly converged")
+	}
+	fresh := []pluginapi.HostAuthFileEntry{
+		{ID: provider.CredentialsFile, Disabled: true, UpdatedAt: freshCutoff},
+		{ID: provider.CredentialsFile + "#primary", UpdatedAt: freshCutoff},
+	}
+	if !authEntriesConverged(fresh, provider.CredentialsFile, expected, freshCutoff) {
+		t.Fatal("fresh exact controller/key state did not converge")
+	}
+}
+
+func TestSaveKeysReportsAuthConvergenceTimeout(t *testing.T) {
+	store := &delayedAuthStore{neverConverge: true}
+	api := New(provider.ID, provider.CredentialsFile, disabledConfig(), store, nil)
+	api.authSyncWait = 20 * time.Millisecond
+	api.authSyncPoll = time.Millisecond
+	resp, _ := api.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+		Method: http.MethodPut,
+		Path:   "/v0/management/plugins/" + provider.ID + "/keys",
+		Body:   sameDestinationBody(t, `{"keys":[{"id":"current","api-key":"sk-current"}]}`),
+	})
+	if resp.StatusCode != http.StatusGatewayTimeout || !bytes.Contains(resp.Body, []byte("auth_reconcile_timeout")) {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, resp.Body)
+	}
+	if store.saveCalls != 1 {
+		t.Fatalf("save calls = %d, want 1", store.saveCalls)
+	}
+}
+
 type blockingSaveAuthStore struct {
 	mu                sync.Mutex
 	raw               []byte
+	updatedAt         time.Time
 	saveCalls         int
 	firstSaveStarted  chan struct{}
 	releaseFirstSave  chan struct{}
@@ -465,7 +732,7 @@ func (s *blockingSaveAuthStore) ListAuth(context.Context) ([]pluginapi.HostAuthF
 	if len(s.raw) == 0 {
 		return nil, nil
 	}
-	return []pluginapi.HostAuthFileEntry{{AuthIndex: "auth-index-1", Name: provider.CredentialsFile, Type: provider.ID, Provider: provider.ID}}, nil
+	return fakeAuthEntriesAt(s.raw, s.updatedAt), nil
 }
 
 func (s *blockingSaveAuthStore) GetAuth(context.Context, pluginapi.HostAuthGetRequest) (pluginapi.HostAuthGetResponse, error) {
@@ -487,6 +754,7 @@ func (s *blockingSaveAuthStore) SaveAuth(_ context.Context, req pluginapi.HostAu
 	}
 	s.mu.Lock()
 	s.raw = append([]byte(nil), req.JSON...)
+	s.updatedAt = time.Now().UTC()
 	s.mu.Unlock()
 	return pluginapi.HostAuthSaveResponse{Name: req.Name}, nil
 }
@@ -540,6 +808,155 @@ func TestConcurrentCredentialSavesAreSerialized(t *testing.T) {
 	}
 }
 
+func TestDiscoverModelsUsesProtocolAuthenticationAndParsesResponses(t *testing.T) {
+	tests := []struct {
+		name         string
+		protocol     config.Protocol
+		responseBody string
+		authHeader   string
+		authValue    string
+		wantName     string
+		wantDisplay  string
+	}{
+		{
+			name: "OpenAI Chat Completions", protocol: config.ProtocolOpenAIChat,
+			responseBody: `{"data":[{"id":"gpt-compatible","name":"Compatible GPT"}]}`,
+			authHeader:   "Authorization", authValue: "Bearer sk-discovery",
+			wantName: "gpt-compatible", wantDisplay: "Compatible GPT",
+		},
+		{
+			name: "OpenAI Responses", protocol: config.ProtocolOpenAIResponses,
+			responseBody: `{"data":[{"id":"response-model","display_name":"Response Model"}]}`,
+			authHeader:   "Authorization", authValue: "Bearer sk-discovery",
+			wantName: "response-model", wantDisplay: "Response Model",
+		},
+		{
+			name: "Anthropic Messages", protocol: config.ProtocolAnthropic,
+			responseBody: `{"data":[{"id":"claude-compatible","display_name":"Claude Compatible"}]}`,
+			authHeader:   "X-Api-Key", authValue: "sk-discovery",
+			wantName: "claude-compatible", wantDisplay: "Claude Compatible",
+		},
+		{
+			name: "Gemini", protocol: config.ProtocolGemini,
+			responseBody: `{"models":[{"name":"models/gemini-compatible","displayName":"Gemini Compatible","supportedGenerationMethods":["generateContent"]},{"name":"models/embedding-only","supportedGenerationMethods":["embedContent"]}]}`,
+			authHeader:   "X-Goog-Api-Key", authValue: "sk-discovery",
+			wantName: "gemini-compatible", wantDisplay: "Gemini Compatible",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.Protocol = test.protocol
+			cfg.BaseURL = "https://draft.example.com/v1"
+			body, err := json.Marshal(map[string]any{
+				"config": cfg,
+				"key":    map[string]any{"id": "draft", "api-key": "sk-discovery"},
+			})
+			if err != nil {
+				t.Fatalf("json.Marshal() error = %v", err)
+			}
+			client := &fakeHTTPClient{response: pluginapi.HTTPResponse{
+				StatusCode: http.StatusOK,
+				Body:       []byte(test.responseBody),
+			}}
+			api := New(provider.ID, provider.CredentialsFile, cfg, &fakeAuthStore{}, nil)
+			api.httpClients = func(proxyURL string) (pluginapi.HostHTTPClient, error) {
+				if proxyURL != "" {
+					t.Fatalf("proxy URL = %q, want empty", proxyURL)
+				}
+				return client, nil
+			}
+			resp, _ := api.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+				Method: http.MethodPost,
+				Path:   "/v0/management/plugins/" + provider.ID + "/models",
+				Body:   body,
+			})
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", resp.StatusCode, resp.Body)
+			}
+			if client.calls != 1 || client.request.Method != http.MethodGet || client.request.URL != "https://draft.example.com/v1/models" {
+				t.Fatalf("request = %#v, calls = %d", client.request, client.calls)
+			}
+			if got := client.request.Headers.Get(test.authHeader); got != test.authValue {
+				t.Fatalf("%s = %q, want %q", test.authHeader, got, test.authValue)
+			}
+			if test.protocol == config.ProtocolAnthropic && client.request.Headers.Get("Anthropic-Version") != "2023-06-01" {
+				t.Fatalf("Anthropic-Version = %q", client.request.Headers.Get("Anthropic-Version"))
+			}
+			var result struct {
+				Models []discoveredModel `json:"models"`
+			}
+			decodeResponse(t, resp, &result)
+			if len(result.Models) != 1 || result.Models[0].Name != test.wantName || result.Models[0].DisplayName != test.wantDisplay {
+				t.Fatalf("models = %#v", result.Models)
+			}
+			if bytes.Contains(resp.Body, []byte("sk-discovery")) {
+				t.Fatalf("response leaked API key: %s", resp.Body)
+			}
+		})
+	}
+}
+
+func TestDiscoverModelsSupportsDirectAndNoneProxyModes(t *testing.T) {
+	for _, proxyMode := range []string{"direct", "none"} {
+		t.Run(proxyMode, func(t *testing.T) {
+			cfg := config.Default()
+			cfg.BaseURL = "https://draft.example.com/v1"
+			body, _ := json.Marshal(map[string]any{
+				"config": cfg,
+				"key": map[string]any{
+					"id": "draft", "api-key": "sk-private", "proxy-url": proxyMode,
+				},
+			})
+			client := &fakeHTTPClient{response: pluginapi.HTTPResponse{
+				StatusCode: http.StatusOK,
+				Body:       []byte(`{"data":[]}`),
+			}}
+			api := New(provider.ID, provider.CredentialsFile, cfg, &fakeAuthStore{}, nil)
+			api.httpClients = func(proxyURL string) (pluginapi.HostHTTPClient, error) {
+				if proxyURL != proxyMode {
+					t.Fatalf("proxy URL = %q, want %q", proxyURL, proxyMode)
+				}
+				return client, nil
+			}
+			resp, _ := api.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+				Method: http.MethodPost, Path: "/v0/management/plugins/" + provider.ID + "/models", Body: body,
+			})
+			if resp.StatusCode != http.StatusOK || client.calls != 1 {
+				t.Fatalf("status = %d, calls = %d, body = %s", resp.StatusCode, client.calls, resp.Body)
+			}
+			if bytes.Contains(resp.Body, []byte("sk-private")) {
+				t.Fatalf("model response leaked API key: %s", resp.Body)
+			}
+		})
+	}
+}
+
+func TestDiscoverModelsRedactsTransportErrors(t *testing.T) {
+	t.Parallel()
+	const apiKey = "sk-private-discovery"
+	const headerSecret = "private-header-value"
+	cfg := config.Default()
+	cfg.BaseURL = "https://draft.example.com/v1"
+	cfg.Headers = map[string]string{"X-Private-Metadata": headerSecret}
+	body, _ := json.Marshal(map[string]any{
+		"config": cfg,
+		"key":    map[string]any{"id": "draft", "api-key": apiKey},
+	})
+	client := &fakeHTTPClient{err: errors.New("request failed with " + apiKey + " and " + headerSecret)}
+	api := New(provider.ID, provider.CredentialsFile, cfg, &fakeAuthStore{}, nil)
+	api.httpClients = func(string) (pluginapi.HostHTTPClient, error) { return client, nil }
+	resp, _ := api.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+		Method: http.MethodPost, Path: "/v0/management/plugins/" + provider.ID + "/models", Body: body,
+	})
+	if resp.StatusCode != http.StatusBadGateway || !bytes.Contains(resp.Body, []byte("[REDACTED]")) {
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, resp.Body)
+	}
+	if bytes.Contains(resp.Body, []byte(apiKey)) || bytes.Contains(resp.Body, []byte(headerSecret)) {
+		t.Fatalf("transport error leaked discovery secrets: %s", resp.Body)
+	}
+}
+
 func TestConnectionResolvesStoredSecretAndRedactsErrors(t *testing.T) {
 	t.Parallel()
 	const secret = "sk-private-connection-secret"
@@ -573,7 +990,7 @@ func TestConnectionResolvesStoredSecretAndRedactsErrors(t *testing.T) {
 	}
 }
 
-func TestConnectionRejectsPerKeyProxyWithoutCallingTester(t *testing.T) {
+func TestConnectionResolvesAndPassesPerKeyProxyToTester(t *testing.T) {
 	t.Parallel()
 	const proxyURL = "socks5://proxy-user:proxy-secret@proxy.example:1080"
 	tester := &fakeTester{}
@@ -592,11 +1009,39 @@ func TestConnectionRejectsPerKeyProxyWithoutCallingTester(t *testing.T) {
 	resp, _ := api.HandleManagement(context.Background(), pluginapi.ManagementRequest{
 		Method: http.MethodPost, Path: "/v0/management/plugins/" + provider.ID + "/test", Body: body,
 	})
-	if resp.StatusCode != http.StatusUnprocessableEntity || tester.calls != 0 || !bytes.Contains(resp.Body, []byte("proxy_test_unsupported")) {
+	if resp.StatusCode != http.StatusOK || tester.calls != 1 || tester.request.Key.ProxyURL != proxyURL {
 		t.Fatalf("status = %d, tester calls = %d, body = %s", resp.StatusCode, tester.calls, resp.Body)
 	}
 	if bytes.Contains(resp.Body, []byte("proxy-secret")) || bytes.Contains(resp.Body, []byte("sk-private")) {
-		t.Fatalf("proxy rejection leaked credentials: %s", resp.Body)
+		t.Fatalf("connection response leaked credentials: %s", resp.Body)
+	}
+}
+
+func TestConnectionSupportsDirectAndNoneProxyModes(t *testing.T) {
+	for _, proxyMode := range []string{"direct", "none"} {
+		t.Run(proxyMode, func(t *testing.T) {
+			tester := &fakeTester{}
+			cfg := config.Default()
+			cfg.BaseURL = "https://api.example.com/v1"
+			cfg.Models = []config.Model{{Name: "model-one"}}
+			body, _ := json.Marshal(map[string]any{
+				"config": cfg,
+				"key": map[string]any{
+					"id": "draft", "api-key": "sk-private", "proxy-url": proxyMode,
+				},
+				"model": "model-one",
+			})
+			api := New(provider.ID, provider.CredentialsFile, cfg, &fakeAuthStore{}, tester)
+			resp, _ := api.HandleManagement(context.Background(), pluginapi.ManagementRequest{
+				Method: http.MethodPost, Path: "/v0/management/plugins/" + provider.ID + "/test", Body: body,
+			})
+			if resp.StatusCode != http.StatusOK || tester.calls != 1 || tester.request.Key.ProxyURL != proxyMode {
+				t.Fatalf("status = %d, calls = %d, body = %s", resp.StatusCode, tester.calls, resp.Body)
+			}
+			if bytes.Contains(resp.Body, []byte("sk-private")) {
+				t.Fatalf("connection response leaked API key: %s", resp.Body)
+			}
+		})
 	}
 }
 

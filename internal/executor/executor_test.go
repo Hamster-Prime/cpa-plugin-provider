@@ -94,6 +94,15 @@ func TestExecuteRoutesAllProtocols(t *testing.T) {
 			if gjson.GetBytes(request.body, "stream").Exists() {
 				t.Fatalf("non-stream body retained stream: %s", request.body)
 			}
+			thinkingPath := map[config.Protocol]string{
+				config.ProtocolOpenAIChat:      "reasoning_effort",
+				config.ProtocolOpenAIResponses: "reasoning.effort",
+				config.ProtocolAnthropic:       "output_config.effort",
+				config.ProtocolGemini:          "generationConfig.thinkingConfig.thinkingLevel",
+			}[test.protocol]
+			if got := gjson.GetBytes(request.body, thinkingPath).String(); got != "high" {
+				t.Fatalf("requested_model thinking field %s = %q, want high: %s", thinkingPath, got, request.body)
+			}
 			if got := gjson.GetBytes(result.Payload, "model").String(); got != "team/public-model" {
 				t.Fatalf("force-mapped response model = %q: %s", got, result.Payload)
 			}
@@ -563,7 +572,9 @@ func TestStreamErrorBodyIsBounded(t *testing.T) {
 func TestStreamErrorBodyCancelsProducerAfterLimit(t *testing.T) {
 	client := &cancellationHostClient{done: make(chan struct{})}
 	cfg := testConfig("https://api.example.com/v1", config.ProtocolOpenAIChat, false)
-	_, err := New(cfg).ExecuteStream(context.Background(), pluginapi.ExecutorRequest{
+	executor := New(cfg)
+	executor.httpClients = func(string) (pluginapi.HostHTTPClient, error) { return client, nil }
+	_, err := executor.ExecuteStream(context.Background(), pluginapi.ExecutorRequest{
 		Model:       "public-model",
 		Payload:     []byte(`{"messages":[]}`),
 		StorageJSON: credentialJSON(cfg, "secret"),

@@ -108,13 +108,25 @@
     .model-detail[hidden] { display: none; }
     .model-detail .span-2 { grid-column: span 2; }
     .model-detail .span-4 { grid-column: 1 / -1; }
+    .section-actions { display: flex; align-items: center; gap: 8px; }
+    .discovery { margin: 0 0 14px; padding: 14px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+    .discovery[hidden] { display: none; }
+    .discovery-toolbar { display: grid; grid-template-columns: minmax(180px, 1fr) auto auto auto; gap: 8px; align-items: center; margin-bottom: 10px; }
+    .discovery-check { display: inline-flex; align-items: center; gap: 7px; margin: 0; color: var(--text); font-size: 12px; white-space: nowrap; }
+    .discovery-check input { width: 16px; min-height: 16px; height: 16px; padding: 0; }
+    .discovery-list { max-height: 280px; overflow: auto; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+    .discovery-option { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 9px; align-items: start; margin: 0; padding: 10px 12px; border-top: 1px solid var(--line); color: var(--text); font-size: 13px; }
+    .discovery-option:first-child { border-top: 0; }
+    .discovery-option input { width: 16px; min-height: 16px; height: 16px; margin-top: 1px; padding: 0; }
+    .discovery-name { min-width: 0; overflow-wrap: anywhere; }
+    .discovery-display { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; }
     .empty { padding: 28px 16px; border: 1px dashed var(--line); border-radius: var(--radius); color: var(--muted); text-align: center; }
     .auth-modal { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 20px; background: rgba(10, 12, 14, .56); }
     .auth-modal[hidden] { display: none; }
     .dialog { width: min(420px, 100%); border: 1px solid var(--line); border-radius: 8px; background: var(--surface); box-shadow: var(--shadow); padding: 22px; }
     .dialog h2 { margin: 0 0 18px; font-size: 17px; }
     .dialog-actions { display: flex; justify-content: flex-end; margin-top: 14px; }
-    .notice { position: fixed; right: 20px; bottom: 20px; z-index: 70; width: min(360px, calc(100% - 40px)); padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
+    .notice { position: fixed; right: 20px; bottom: 20px; z-index: 70; width: max-content; max-width: min(360px, calc(100% - 40px)); padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); pointer-events: none; }
     .notice[hidden] { display: none; }
     .notice.error { border-color: var(--danger); color: var(--danger); }
     .notice.success { border-color: var(--accent); color: var(--accent-strong); }
@@ -133,6 +145,8 @@
       .model-detail .span-4 { grid-column: 1 / -1; }
       .model-main { grid-template-columns: 1fr 1fr; }
       .model-main .field:last-child { grid-column: 1 / -1; }
+      .discovery-toolbar { grid-template-columns: minmax(180px, 1fr) auto auto; }
+      .discovery-toolbar .discovery-check { grid-column: 1 / -1; grid-row: 2; }
     }
     @media (max-width: 560px) {
       .shell { padding: 14px 12px 40px; }
@@ -146,7 +160,13 @@
       .key-grid, .model-main, .model-detail, .testbar { grid-template-columns: 1fr; }
       .model-detail .span-2, .model-detail .span-4 { grid-column: 1; }
       .row { grid-template-columns: 1fr 1fr 36px; }
+      .section-head { align-items: flex-start; }
+      .section-actions { flex-wrap: wrap; justify-content: flex-end; }
+      .discovery-toolbar { grid-template-columns: 1fr 1fr; }
+      .discovery-toolbar input[type="search"] { grid-column: 1 / -1; }
+      .discovery-toolbar .discovery-check { grid-column: 1 / -1; grid-row: auto; }
       .section { padding-block: 19px 22px; }
+      .notice { right: 12px; bottom: 12px; max-width: calc(100% - 24px); }
     }
   </style>
 </head>
@@ -207,7 +227,19 @@
       <section class="section">
         <div class="section-head">
           <div><h2 class="section-title">模型</h2><span class="count" id="models-count">0</span></div>
-          <button class="btn small" id="add-model" type="button">+ 添加模型</button>
+          <div class="section-actions">
+            <button class="btn small" id="discover-models" type="button">获取模型</button>
+            <button class="btn small" id="add-model" type="button">+ 添加模型</button>
+          </div>
+        </div>
+        <div class="discovery" id="model-discovery" hidden>
+          <div class="discovery-toolbar">
+            <input id="discovery-search" type="search" placeholder="筛选模型" aria-label="筛选已发现模型">
+            <label class="discovery-check"><input id="discovery-select-all" type="checkbox"><span>全选</span></label>
+            <button class="btn small primary" id="import-models" type="button">导入所选</button>
+            <button class="btn small" id="close-discovery" type="button">关闭</button>
+          </div>
+          <div class="discovery-list" id="discovered-models"></div>
         </div>
         <div class="rows" id="models-list"></div>
       </section>
@@ -238,10 +270,19 @@
   (() => {
     'use strict';
     const PLUGIN_ID = 'multi-protocol-provider';
-    const STORAGE_KEY = 'cpa:multi-protocol-provider:management-key';
     const MANAGEMENT = '/v0/management';
     const API = `${MANAGEMENT}/plugins/${PLUGIN_ID}`;
-    const state = { config: null, credentialDestination: null, keys: [], noticeTimer: 0, busy: false };
+    const state = {
+      config: null,
+      credentialDestination: null,
+      keys: [],
+      discoveredModels: [],
+      baseline: '',
+      dirty: false,
+      noticeTimer: 0,
+      busy: false
+    };
+    let managementToken = '';
     const $ = (selector, root = document) => root.querySelector(selector);
     const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
     const app = $('#app');
@@ -249,9 +290,9 @@
     const authModal = $('#auth-modal');
     const managementKey = $('#management-key');
 
-    function getToken() { try { return sessionStorage.getItem(STORAGE_KEY) || ''; } catch (_) { return ''; } }
-    function setToken(value) { try { value ? sessionStorage.setItem(STORAGE_KEY, value) : sessionStorage.removeItem(STORAGE_KEY); } catch (_) {} }
-    function showAuth() { authModal.hidden = false; managementKey.value = getToken(); setTimeout(() => managementKey.focus(), 0); }
+    function getToken() { return managementToken; }
+    function setToken(value) { managementToken = String(value || ''); }
+    function showAuth() { authModal.hidden = false; managementKey.value = ''; setTimeout(() => managementKey.focus(), 0); }
     function hideAuth() { authModal.hidden = true; }
     function notify(message, kind = '') {
       const el = $('#notice');
@@ -267,6 +308,8 @@
       app.setAttribute('aria-busy', String(value));
       $('#save-button').disabled = value;
       $('#test-button').disabled = value;
+      $('#discover-models').disabled = value;
+      updateDiscoveryControls();
     }
     function setConnected(value) {
       $('#status-dot').classList.toggle('ready', value);
@@ -331,7 +374,7 @@
       const valueInput = textInput(value, { placeholder: 'Value', 'aria-label': '请求头值' });
       const remove = element('button', { class: 'btn icon danger', type: 'button', title: '删除请求头', 'aria-label': '删除请求头', text: '×' });
       const row = element('div', { class: 'row' }, [field('名称', nameInput), field('值', valueInput), remove]);
-      remove.addEventListener('click', () => { row.remove(); if (!list.children.length) list.append(empty('暂无自定义请求头')); });
+      remove.addEventListener('click', () => { row.remove(); if (!list.children.length) list.append(empty('暂无自定义请求头')); updateDirty(); });
       list.append(row);
     }
 
@@ -358,18 +401,18 @@
         secretInput.type = secretInput.type === 'password' ? 'text' : 'password';
         reveal.textContent = secretInput.type === 'password' ? '显示' : '隐藏';
       });
-      const proxyInput = textInput(key['proxy-url'], { placeholder: 'http://127.0.0.1:7890、socks5://... 或 direct' });
+      const proxyInput = textInput(key['proxy-url'], { placeholder: 'http://127.0.0.1:7890、socks5://...、direct 或 none' });
       const priorityInput = textInput(key.priority ?? 0, { type: 'number', min: -1000000, max: 1000000, step: 1 });
       const disabled = checkbox(key.disabled, '停用');
       disabled.querySelector('input').className = 'key-disabled';
       const remove = element('button', { class: 'btn icon danger', type: 'button', title: '删除 Key', 'aria-label': '删除 Key', text: '×' });
       const title = element('div', { class: 'item-name', text: key.label || key.masked || '新 API Key' });
-      labelInput.addEventListener('input', () => { title.textContent = labelInput.value || key.masked || '新 API Key'; });
+      labelInput.addEventListener('input', () => { title.textContent = labelInput.value || key.masked || '新 API Key'; updateCountsAndTestOptions(); });
       const head = element('div', { class: 'item-head' }, [title, element('div', { class: 'item-actions' }, [disabled, remove])]);
       const secretWrap = element('div', { class: 'secret-wrap' }, [secretInput, reveal]);
       const grid = element('div', { class: 'key-grid' }, [field('标签', labelInput), field('API Key', secretWrap), field('代理 URL', proxyInput), field('优先级', priorityInput)]);
       wrap.append(head, grid);
-      remove.addEventListener('click', () => { wrap.remove(); updateCountsAndTestOptions(); if (!$('#keys-list').children.length) $('#keys-list').append(empty('暂无 API Key')); });
+      remove.addEventListener('click', () => { wrap.remove(); updateCountsAndTestOptions(); if (!$('#keys-list').children.length) $('#keys-list').append(empty('暂无 API Key')); updateDirty(); });
       return wrap;
     }
 
@@ -407,9 +450,82 @@
       alias.addEventListener('input', () => { title.textContent = alias.value || name.value || '新模型'; updateCountsAndTestOptions(); });
       imageInput.addEventListener('change', updateCountsAndTestOptions);
       more.addEventListener('click', () => { detail.hidden = !detail.hidden; more.textContent = detail.hidden ? '参数' : '收起'; });
-      remove.addEventListener('click', () => { wrap.remove(); updateCountsAndTestOptions(); if (!$('#models-list').children.length) $('#models-list').append(empty('暂无模型')); });
+      remove.addEventListener('click', () => { wrap.remove(); updateCountsAndTestOptions(); if (!$('#models-list').children.length) $('#models-list').append(empty('暂无模型')); updateDirty(); });
       wrap.append(element('div', { class: 'item-head' }, [title, element('div', { class: 'item-actions' }, [more, remove])]), element('div', { class: 'model-main' }, [field('上游模型名', name), field('别名', alias), field('显示名称', display)]), detail);
       return wrap;
+    }
+
+    function visibleDiscoveredModels() {
+      const query = $('#discovery-search').value.trim().toLowerCase();
+      return state.discoveredModels
+        .map((model, index) => ({ model, index }))
+        .filter(({ model }) => !query || model.name.toLowerCase().includes(query) || String(model['display-name'] || '').toLowerCase().includes(query));
+    }
+    function renderDiscoveredModels() {
+      const list = $('#discovered-models');
+      const visible = visibleDiscoveredModels();
+      list.replaceChildren();
+      visible.forEach(({ model, index }) => {
+        const input = element('input', { type: 'checkbox', 'aria-label': `选择 ${model.name}` });
+        input.checked = Boolean(model.selected);
+        input.addEventListener('change', () => { state.discoveredModels[index].selected = input.checked; updateDiscoveryControls(); });
+        const details = element('span', { class: 'discovery-name', text: model.name });
+        if (model['display-name'] && model['display-name'] !== model.name) {
+          details.append(element('span', { class: 'discovery-display', text: model['display-name'] }));
+        }
+        list.append(element('label', { class: 'discovery-option' }, [input, details]));
+      });
+      if (!visible.length) list.append(empty(state.discoveredModels.length ? '没有匹配的模型' : '未发现可导入模型'));
+      updateDiscoveryControls();
+    }
+    function updateDiscoveryControls() {
+      const visible = visibleDiscoveredModels();
+      const selectedVisible = visible.filter(({ model }) => model.selected).length;
+      const selectAll = $('#discovery-select-all');
+      selectAll.checked = visible.length > 0 && selectedVisible === visible.length;
+      selectAll.indeterminate = selectedVisible > 0 && selectedVisible < visible.length;
+      selectAll.disabled = state.busy || visible.length === 0;
+      $('#import-models').disabled = state.busy || !state.discoveredModels.some((model) => model.selected);
+      $('#close-discovery').disabled = state.busy;
+    }
+    async function discoverModels() {
+      let config = collectConfig(); const keys = collectKeys();
+      if (!validate(config, keys, false)) return;
+      const key = keys.find((item) => item.id === $('#test-key').value);
+      if (!key) { notify('请先选择用于获取模型的 API Key', 'error'); return; }
+      setBusy(true);
+      try {
+        const validation = await request(`${API}/validate`, { method: 'POST', body: JSON.stringify({ config }) });
+        config = validation.config;
+        const result = await request(`${API}/models`, { method: 'POST', body: JSON.stringify({ config, key }) });
+        const seen = new Set();
+        state.discoveredModels = (result.models || [])
+          .map((model) => ({ name: String(model.name || '').trim(), 'display-name': String(model['display-name'] || '').trim(), selected: false }))
+          .filter((model) => model.name && !seen.has(model.name) && seen.add(model.name));
+        $('#discovery-search').value = '';
+        $('#model-discovery').hidden = false;
+        renderDiscoveredModels();
+        notify(`发现 ${state.discoveredModels.length} 个模型`, state.discoveredModels.length ? 'success' : '');
+      } catch (error) { notify(error.message, 'error'); }
+      finally { setBusy(false); }
+    }
+    function importSelectedModels() {
+      const selected = state.discoveredModels.filter((model) => model.selected);
+      if (!selected.length) return;
+      const existing = new Set($$('#models-list .item').map((item) => $('.model-main input', item).value.trim()));
+      const list = $('#models-list');
+      $('.empty', list)?.remove();
+      let imported = 0;
+      selected.forEach((model) => {
+        if (existing.has(model.name)) return;
+        existing.add(model.name);
+        list.append(modelItem({ name: model.name, 'display-name': model['display-name'] }));
+        imported++;
+      });
+      updateCountsAndTestOptions();
+      updateDirty();
+      $('#model-discovery').hidden = true;
+      notify(imported ? `已导入 ${imported} 个模型` : '所选模型已经存在', imported ? 'success' : '');
     }
 
     function commaList(value) { return value.split(',').map((v) => v.trim().toLowerCase()).filter((v, i, all) => v && all.indexOf(v) === i); }
@@ -467,6 +583,73 @@
         }
         return result;
       });
+    }
+    function normalizedList(values = []) {
+      const seen = new Set();
+      return values.map((value) => String(value).trim().toLowerCase()).filter((value) => value && !seen.has(value) && seen.add(value));
+    }
+    function canonicalConfig(value = {}) {
+      const headers = Object.entries(value.headers || {})
+        .map(([name, headerValue]) => [String(name).trim(), String(headerValue).trim()])
+        .filter(([name]) => name)
+        .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+      const models = (value.models || []).map((model) => {
+        const thinking = model.thinking == null ? null : {
+          min: Number(model.thinking.min || 0),
+          max: Number(model.thinking.max || 0),
+          'zero-allowed': Boolean(model.thinking['zero-allowed']),
+          'dynamic-allowed': Boolean(model.thinking['dynamic-allowed']),
+          levels: normalizedList(model.thinking.levels || [])
+        };
+        return {
+          name: String(model.name || '').trim(),
+          alias: String(model.alias || '').trim(),
+          'display-name': String(model['display-name'] || '').trim(),
+          'force-mapping': Boolean(model['force-mapping']),
+          image: Boolean(model.image),
+          'input-modalities': normalizedList(model['input-modalities'] || []),
+          'output-modalities': normalizedList(model['output-modalities'] || []),
+          thinking
+        };
+      });
+      const name = String(value.name || '').trim();
+      return {
+        name: name || 'Custom Provider',
+        priority: Number(value.priority || 0),
+        protocol: String(value.protocol || 'openai-chat-completions').trim().toLowerCase(),
+        'base-url': String(value['base-url'] || '').trim().replace(/\/+$/, ''),
+        prefix: String(value.prefix || '').trim().replace(/^\/+|\/+$/g, ''),
+        disabled: Boolean(value.disabled),
+        'disable-cooling': Boolean(value['disable-cooling']),
+        headers,
+        models,
+        'test-model': String(value['test-model'] || '').trim()
+      };
+    }
+    function configsEqual(left, right) {
+      return JSON.stringify(canonicalConfig(left)) === JSON.stringify(canonicalConfig(right));
+    }
+    function draftSnapshot() {
+      return JSON.stringify({
+        config: canonicalConfig(collectConfig()),
+        keys: collectKeys().map((key) => ({
+          id: String(key.id || ''),
+          label: String(key.label || ''),
+          'api-key': String(key['api-key'] || ''),
+          'proxy-url': String(key['proxy-url'] || ''),
+          'preserve-proxy-url': Boolean(key['preserve-proxy-url']),
+          priority: Number(key.priority || 0),
+          disabled: Boolean(key.disabled)
+        }))
+      });
+    }
+    function markClean() {
+      state.baseline = draftSnapshot();
+      state.dirty = false;
+    }
+    function updateDirty() {
+      if (!state.config) return;
+      state.dirty = draftSnapshot() !== state.baseline;
     }
     function fillConfig(config) {
       state.config = config;
@@ -562,6 +745,7 @@
         state.credentialDestination = data['credential-destination'] || null;
         fillConfig(data.config || {});
         renderKeys(data.keys || []);
+        markClean();
         setConnected(true);
         hideAuth();
       } catch (error) { setConnected(false); if (getToken()) notify(error.message, 'error'); }
@@ -579,12 +763,29 @@
       }
       throw lastError || new Error('等待提供商停用超时');
     }
+    async function waitUntilConfigMatches(target) {
+      const deadline = Date.now() + 15000;
+      let lastError;
+      while (Date.now() < deadline) {
+        try {
+          const data = await request(`${API}/state`);
+          if (configsEqual(data.config || {}, target)) return data;
+        } catch (error) {
+          lastError = error;
+          if (!getToken()) throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      throw lastError || new Error('等待 CPA 应用最终配置超时');
+    }
     async function save() {
-      const config = collectConfig(); const keys = collectKeys();
+      let config = collectConfig(); const keys = collectKeys();
       if (!validate(config, keys)) return;
       setBusy(true);
       let disabledConfirmed = false;
       try {
+        const validation = await request(`${API}/validate`, { method: 'POST', body: JSON.stringify({ config }) });
+        config = validation.config;
         await request(`${MANAGEMENT}/plugins/${PLUGIN_ID}/config`, { method: 'PATCH', body: JSON.stringify({ disabled: true }) });
         await waitUntilProviderDisabled();
         disabledConfirmed = true;
@@ -592,15 +793,28 @@
           method: 'PUT',
           body: JSON.stringify({ keys, destination: { protocol: config.protocol, 'base-url': config['base-url'] } })
         });
-        await request(`${MANAGEMENT}/plugins/${PLUGIN_ID}/config`, { method: 'PATCH', body: JSON.stringify(config) });
-        state.config = config;
-        $('#page-title').textContent = config.name;
+        // Stock CPA preserves comments by merging YAML mappings even for PUT.
+        // An explicit null is required to clear the last custom header.
+        const hostConfig = { ...config, headers: Object.keys(config.headers || {}).length ? config.headers : null };
+        await request(`${MANAGEMENT}/plugins/${PLUGIN_ID}/config`, { method: 'PUT', body: JSON.stringify(hostConfig) });
+        const applied = await waitUntilConfigMatches(config);
+        state.credentialDestination = applied['credential-destination'] || null;
+        fillConfig(applied.config || {});
+        renderKeys(applied.keys || []);
+        markClean();
         notify('配置已保存', 'success');
-        setTimeout(load, 450);
       } catch (error) {
         if (disabledConfirmed) {
-          $('#provider-disabled').checked = true;
-          notify(`保存未完成，提供商保持停用：${error.message}`, 'error');
+          let currentlyDisabled = true;
+          try {
+            const current = await request(`${API}/state`);
+            currentlyDisabled = Boolean(current.config?.disabled);
+            $('#provider-disabled').checked = currentlyDisabled;
+          } catch (_) {
+            $('#provider-disabled').checked = true;
+          }
+          updateDirty();
+          notify(`保存未完成，提供商当前${currentlyDisabled ? '保持停用' : '已启用'}：${error.message}`, 'error');
         } else {
           notify(error.message, 'error');
         }
@@ -623,17 +837,34 @@
       finally { setBusy(false); }
     }
 
-    $('#add-header').addEventListener('click', () => addHeaderRow());
-    $('#add-key').addEventListener('click', () => { $('.empty', $('#keys-list'))?.remove(); $('#keys-list').append(keyItem({ id: newID('key') })); updateCountsAndTestOptions(); });
-    $('#add-model').addEventListener('click', () => { $('.empty', $('#models-list'))?.remove(); $('#models-list').append(modelItem({})); updateCountsAndTestOptions(); });
+    $('#add-header').addEventListener('click', () => { addHeaderRow(); updateDirty(); });
+    $('#add-key').addEventListener('click', () => { $('.empty', $('#keys-list'))?.remove(); $('#keys-list').append(keyItem({ id: newID('key') })); updateCountsAndTestOptions(); updateDirty(); });
+    $('#add-model').addEventListener('click', () => { $('.empty', $('#models-list'))?.remove(); $('#models-list').append(modelItem({})); updateCountsAndTestOptions(); updateDirty(); });
+    $('#discover-models').addEventListener('click', discoverModels);
+    $('#import-models').addEventListener('click', importSelectedModels);
+    $('#close-discovery').addEventListener('click', () => { $('#model-discovery').hidden = true; });
+    $('#discovery-search').addEventListener('input', renderDiscoveredModels);
+    $('#discovery-select-all').addEventListener('change', (event) => {
+      visibleDiscoveredModels().forEach(({ index }) => { state.discoveredModels[index].selected = event.target.checked; });
+      renderDiscoveredModels();
+    });
     $('#auth-button').addEventListener('click', showAuth);
     $('#save-button').addEventListener('click', save);
     $('#test-button').addEventListener('click', testConnection);
     $('#test-model').addEventListener('input', updateCountsAndTestOptions);
     $('#prefix').addEventListener('input', updateCountsAndTestOptions);
-    $('#auth-form').addEventListener('submit', (event) => { event.preventDefault(); const value = managementKey.value.trim(); if (!value) return; setToken(value); load(); });
+    $('#auth-form').addEventListener('submit', (event) => { event.preventDefault(); const value = managementKey.value.trim(); if (!value) return; setToken(value); managementKey.value = ''; load(); });
+    const handleDraftMutation = (event) => { if (!event.target.closest?.('#model-discovery')) updateDirty(); };
+    form.addEventListener('input', handleDraftMutation);
+    form.addEventListener('change', handleDraftMutation);
     form.addEventListener('submit', (event) => { event.preventDefault(); save(); });
-    if (getToken()) load(); else { setBusy(false); showAuth(); }
+    window.addEventListener('beforeunload', (event) => {
+      if (!state.dirty) return;
+      event.preventDefault();
+      event.returnValue = '';
+    });
+    setBusy(false);
+    showAuth();
   })();
   </script>
 </body>

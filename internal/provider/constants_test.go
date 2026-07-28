@@ -6,6 +6,18 @@ import (
 	"github.com/Hamster-Prime/cpa-plugin-provider/internal/config"
 )
 
+func TestPublishedMetadata(t *testing.T) {
+	if ID != "multi-protocol-provider" {
+		t.Fatalf("ID = %q", ID)
+	}
+	if Version != "0.2.0" {
+		t.Fatalf("Version = %q", Version)
+	}
+	if DisplayName != "Multi-Protocol Provider" || Author != "Hamster-Prime" || Repository != "https://github.com/Hamster-Prime/cpa-plugin-provider" {
+		t.Fatalf("published metadata is inconsistent: name=%q author=%q repository=%q", DisplayName, Author, Repository)
+	}
+}
+
 func TestCloneConfigDoesNotShareMutableValues(t *testing.T) {
 	original := config.Config{
 		Headers: map[string]string{"X-Test": "one"},

@@ -50,15 +50,15 @@ type Model struct {
 
 type Config struct {
 	Name           string            `yaml:"name" json:"name"`
-	Priority       int               `yaml:"priority,omitempty" json:"priority,omitempty"`
+	Priority       int               `yaml:"priority,omitempty" json:"priority"`
 	Protocol       Protocol          `yaml:"protocol" json:"protocol"`
 	BaseURL        string            `yaml:"base-url" json:"base-url"`
-	Prefix         string            `yaml:"prefix,omitempty" json:"prefix,omitempty"`
-	Disabled       bool              `yaml:"disabled,omitempty" json:"disabled,omitempty"`
-	DisableCooling bool              `yaml:"disable-cooling,omitempty" json:"disable-cooling,omitempty"`
-	Headers        map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
-	Models         []Model           `yaml:"models,omitempty" json:"models,omitempty"`
-	TestModel      string            `yaml:"test-model,omitempty" json:"test-model,omitempty"`
+	Prefix         string            `yaml:"prefix,omitempty" json:"prefix"`
+	Disabled       bool              `yaml:"disabled,omitempty" json:"disabled"`
+	DisableCooling bool              `yaml:"disable-cooling,omitempty" json:"disable-cooling"`
+	Headers        map[string]string `yaml:"headers,omitempty" json:"headers"`
+	Models         []Model           `yaml:"models,omitempty" json:"models"`
+	TestModel      string            `yaml:"test-model,omitempty" json:"test-model"`
 }
 
 func Default() Config {
@@ -181,7 +181,9 @@ func (p Protocol) Valid() bool {
 func (p Protocol) ExecutorFormat() string {
 	switch p {
 	case ProtocolOpenAIResponses:
-		return "openai-response"
+		// CPA uses "codex" as the canonical upstream wire format for the
+		// OpenAI Responses API. "openai-response" is the client-facing format.
+		return "codex"
 	case ProtocolAnthropic:
 		return "claude"
 	case ProtocolGemini:

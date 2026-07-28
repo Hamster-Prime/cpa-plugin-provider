@@ -23,10 +23,10 @@ fmt:
 	$(GO) fmt ./...
 
 test:
-	$(GO) test ./... ./.github/scripts
+	$(GO) test ./... ./.github/scripts ./.github/scripts/stock-e2e
 
 race:
-	$(GO) test -race ./... ./.github/scripts
+	$(GO) test -race ./... ./.github/scripts ./.github/scripts/stock-e2e
 
 vet:
-	$(GO) vet ./... ./.github/scripts
+	$(GO) vet ./... ./.github/scripts ./.github/scripts/stock-e2e

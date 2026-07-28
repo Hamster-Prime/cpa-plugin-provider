@@ -81,9 +81,10 @@ func TestHandleRegisterDeclaresDynamicCapabilities(t *testing.T) {
 		!registration.Capabilities.ThinkingApplier || !registration.Capabilities.ManagementAPI {
 		t.Fatalf("missing capability: %#v", registration.Capabilities)
 	}
-	wantFormats := []string{"openai-response", "openai-image"}
-	if !equalStringSlices(registration.Capabilities.ExecutorInputFormats, wantFormats) ||
-		!equalStringSlices(registration.Capabilities.ExecutorOutputFormats, wantFormats) {
+	wantInputFormats := []string{"codex", "openai-image"}
+	wantOutputFormats := []string{"openai", "openai-response", "claude", "gemini", "openai-image"}
+	if !equalStringSlices(registration.Capabilities.ExecutorInputFormats, wantInputFormats) ||
+		!equalStringSlices(registration.Capabilities.ExecutorOutputFormats, wantOutputFormats) {
 		t.Fatalf("formats = %#v / %#v", registration.Capabilities.ExecutorInputFormats, registration.Capabilities.ExecutorOutputFormats)
 	}
 }

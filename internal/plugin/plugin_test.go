@@ -3,7 +3,9 @@ package plugin
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	providerauth "github.com/Hamster-Prime/cpa-plugin-provider/internal/auth"
@@ -28,15 +30,32 @@ models:
 	if instance == nil || registered.Capabilities.AuthProvider != instance || registered.Capabilities.ManagementAPI != instance {
 		t.Fatalf("capabilities are not wired to plugin instance")
 	}
-	want := []string{"claude", "openai-image"}
-	if !equalStrings(registered.Capabilities.ExecutorInputFormats, want) || !equalStrings(registered.Capabilities.ExecutorOutputFormats, want) {
-		t.Fatalf("executor formats = %#v / %#v, want %#v", registered.Capabilities.ExecutorInputFormats, registered.Capabilities.ExecutorOutputFormats, want)
+	wantInput := []string{"claude", "openai-image"}
+	wantOutput := []string{"openai", "openai-response", "claude", "gemini", "openai-image"}
+	if !equalStrings(registered.Capabilities.ExecutorInputFormats, wantInput) || !equalStrings(registered.Capabilities.ExecutorOutputFormats, wantOutput) {
+		t.Fatalf("executor formats = %#v / %#v, want %#v / %#v", registered.Capabilities.ExecutorInputFormats, registered.Capabilities.ExecutorOutputFormats, wantInput, wantOutput)
 	}
 	if registered.Metadata.GitHubRepository != provider.Repository || len(registered.Metadata.ConfigFields) == 0 {
 		t.Fatalf("metadata = %#v", registered.Metadata)
 	}
 	if registered.Capabilities.ExecutorModelScope != pluginapi.ExecutorModelScopeOAuth {
 		t.Fatalf("executor model scope = %q, want auth-bound scope", registered.Capabilities.ExecutorModelScope)
+	}
+}
+
+func TestBuildDeclaresCodexInputForResponsesUpstream(t *testing.T) {
+	registered, _, err := Build([]byte(`
+protocol: openai-responses
+base-url: https://api.example.com/v1
+models:
+  - name: gpt-test
+`), Dependencies{})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	want := []string{"codex", "openai-image"}
+	if !equalStrings(registered.Capabilities.ExecutorInputFormats, want) {
+		t.Fatalf("executor input formats = %#v, want %#v", registered.Capabilities.ExecutorInputFormats, want)
 	}
 }
 
@@ -128,48 +147,46 @@ func TestModelsForAuthHidesModelsForUnboundOrMismatchedCredential(t *testing.T) 
 }
 
 func TestConnectionUsesProtocolPayloadAndResolvedUpstreamModel(t *testing.T) {
+	var requestPath string
+	var requestBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestPath = r.URL.Path
+		var err error
+		requestBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"candidates":[]}`))
+	}))
+	defer server.Close()
+
 	cfg := config.Config{
-		Name: "Test", Protocol: config.ProtocolGemini, BaseURL: "https://api.example.com/v1beta",
+		Name: "Test", Protocol: config.ProtocolGemini, BaseURL: server.URL + "/v1beta",
 		Models: []config.Model{{Name: "native-model", Alias: "public-model"}},
 	}
 	_, instance, err := Build(mustYAML(t, cfg), Dependencies{})
 	if err != nil {
 		t.Fatalf("Build() error = %v", err)
 	}
-	client := &recordingHTTPClient{response: pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"candidates":[]}`)}}
 	result, err := instance.TestConnection(context.Background(), management.TestRequest{
-		Config:     cfg,
-		Key:        providerauth.Key{APIKey: "secret"},
-		Model:      "public-model",
-		HTTPClient: client,
+		Config: cfg,
+		Key:    providerauth.Key{APIKey: "secret", ProxyURL: "direct"},
+		Model:  "public-model",
 	})
 	if err != nil {
 		t.Fatalf("TestConnection() error = %v", err)
 	}
-	if result.StatusCode != http.StatusOK || client.request.URL != "https://api.example.com/v1beta/models/native-model:generateContent" {
-		t.Fatalf("result/request = %#v / %#v", result, client.request)
+	if result.StatusCode != http.StatusOK || requestPath != "/v1beta/models/native-model:generateContent" {
+		t.Fatalf("result/path = %#v / %q", result, requestPath)
 	}
 	var body map[string]any
-	if err = json.Unmarshal(client.request.Body, &body); err != nil {
+	if err = json.Unmarshal(requestBody, &body); err != nil {
 		t.Fatalf("decode request body: %v", err)
 	}
 	if _, exists := body["model"]; exists {
 		t.Fatalf("Gemini request body unexpectedly contains model: %#v", body)
 	}
-}
-
-type recordingHTTPClient struct {
-	request  pluginapi.HTTPRequest
-	response pluginapi.HTTPResponse
-}
-
-func (c *recordingHTTPClient) Do(_ context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
-	c.request = req
-	return c.response, nil
-}
-
-func (c *recordingHTTPClient) DoStream(context.Context, pluginapi.HTTPRequest) (pluginapi.HTTPStreamResponse, error) {
-	panic("unexpected stream call")
 }
 
 func equalStrings(left, right []string) bool {

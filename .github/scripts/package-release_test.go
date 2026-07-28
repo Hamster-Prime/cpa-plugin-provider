@@ -15,7 +15,6 @@ func TestPackageReleaseIncludesRequiredFiles(t *testing.T) {
 	writeTestFile(t, filepath.Join(root, "LICENSE"), "license")
 	writeTestFile(t, filepath.Join(root, "THIRD_PARTY_NOTICES.md"), "notices")
 	writeTestFile(t, filepath.Join(root, "LICENSES", "Apache-2.0.txt"), "apache license")
-	writeTestFile(t, filepath.Join(root, filepath.FromSlash(hostPatchArchivePath)), "patch")
 	libraryPath := filepath.Join(root, "dist", "multi-protocol-provider.so")
 	writeTestFile(t, libraryPath, "library")
 	archivePath := filepath.Join(root, "release.zip")
@@ -36,8 +35,7 @@ func TestPackageReleaseIncludesRequiredFiles(t *testing.T) {
 		"README.md":                  {content: "readme", mode: 0o644},
 		"LICENSE":                    {content: "license", mode: 0o644},
 		"THIRD_PARTY_NOTICES.md":     {content: "notices", mode: 0o644},
-		"LICENSES/Apache-2.0.txt":     {content: "apache license", mode: 0o644},
-		hostPatchArchivePath:         {content: "patch", mode: 0o644},
+		"LICENSES/Apache-2.0.txt":    {content: "apache license", mode: 0o644},
 	}
 	if len(reader.File) != len(want) {
 		t.Fatalf("archive entries = %d, want %d", len(reader.File), len(want))

@@ -1,6 +1,7 @@
 package thinking
 
 import (
+	"bytes"
 	"context"
 	"testing"
 
@@ -129,5 +130,72 @@ func TestInvalidBodyBecomesValidJSONAndIdentifierMatchesProvider(t *testing.T) {
 	})
 	if err != nil || !gjson.ValidBytes(resp.Body) || gjson.GetBytes(resp.Body, "reasoning.effort").String() != "none" {
 		t.Fatalf("ApplyThinking() body=%s error=%v", resp.Body, err)
+	}
+}
+
+func TestApplyRequestedModelUsesSuffixAcrossProtocols(t *testing.T) {
+	tests := []struct {
+		name      string
+		protocol  config.Protocol
+		requested string
+		support   *pluginapi.ThinkingSupport
+		body      string
+		path      string
+		want      string
+	}{
+		{
+			name: "OpenAI chat level", protocol: config.ProtocolOpenAIChat, requested: "team/model(high)",
+			support: &pluginapi.ThinkingSupport{Levels: []string{"low", "medium", "high"}}, body: `{}`,
+			path: "reasoning_effort", want: "high",
+		},
+		{
+			name: "OpenAI Responses cannot disable", protocol: config.ProtocolOpenAIResponses, requested: "model(none)",
+			support: &pluginapi.ThinkingSupport{Levels: []string{"low", "high"}}, body: `{}`,
+			path: "reasoning.effort", want: "low",
+		},
+		{
+			name: "Anthropic numeric clamp", protocol: config.ProtocolAnthropic, requested: "model(20000)",
+			support: &pluginapi.ThinkingSupport{Min: 1024, Max: 16000}, body: `{"max_tokens":5000}`,
+			path: "thinking.budget_tokens", want: "4999",
+		},
+		{
+			name: "Gemini dynamic", protocol: config.ProtocolGemini, requested: "model(auto)",
+			support: &pluginapi.ThinkingSupport{Min: 0, Max: 32768, DynamicAllowed: true}, body: `{}`,
+			path: "generationConfig.thinkingConfig.thinkingBudget", want: "-1",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body, err := ApplyRequestedModel(context.Background(), test.protocol, []byte(test.body), test.requested, pluginapi.ModelInfo{Thinking: test.support})
+			if err != nil {
+				t.Fatal(err)
+			}
+			value := gjson.GetBytes(body, test.path)
+			if value.String() != test.want {
+				t.Fatalf("%s = %q, want %q; body=%s", test.path, value.String(), test.want, body)
+			}
+		})
+	}
+}
+
+func TestApplyRequestedModelNoSuffixIsExactPassthrough(t *testing.T) {
+	body := []byte("{ \"messages\" : [] }\n")
+	got, err := ApplyRequestedModel(context.Background(), config.ProtocolOpenAIChat, body, "model", pluginapi.ModelInfo{
+		Thinking: &pluginapi.ThinkingSupport{Levels: []string{"low", "high"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("passthrough body = %q, want %q", got, body)
+	}
+}
+
+func TestApplyRequestedModelRejectsUnsupportedExplicitLevel(t *testing.T) {
+	_, err := ApplyRequestedModel(context.Background(), config.ProtocolGemini, []byte(`{}`), "model(xhigh)", pluginapi.ModelInfo{
+		Thinking: &pluginapi.ThinkingSupport{Levels: []string{"low", "high"}},
+	})
+	if err == nil {
+		t.Fatal("ApplyRequestedModel() accepted an unsupported explicit level")
 	}
 }

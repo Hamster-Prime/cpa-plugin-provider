@@ -2,4 +2,3 @@ README.md text eol=lf
 LICENSE text eol=lf
 THIRD_PARTY_NOTICES.md text eol=lf
 LICENSES/*.txt text eol=lf
-patches/*.patch text eol=lf -whitespace
