@@ -52,6 +52,19 @@ CPA 需要能够访问 `raw.githubusercontent.com` 和 GitHub Release 下载地�
 
 如果旧版 registry 已经返回过 GitHub API `403 rate limit exceeded`，请在本次 registry 更新后重启 CPA（或等待失败缓存过期）并刷新插件商店，然后重新安装；无需配置 GitHub Token。
 
+CPA 内置官方库在刷新其它插件的版本信息时仍可能访问 GitHub API；如果希望同时提高这些请求的配额，可以把 Token 放在环境变量中，再添加可选配置（不要把 Token 写进 YAML 或 registry）：
+
+```yaml
+plugins:
+  store-auth:
+    - match: "https://api.github.com/"
+      apply-to: ["metadata"]
+      type: github-token
+      token-env: "CPA_PLUGIN_GITHUB_TOKEN"
+```
+
+然后在启动 CPA 的环境中设置 `CPA_PLUGIN_GITHUB_TOKEN`。本项目的 direct registry 安装路径本身不需要这个 Token。
+
 “通用提供商”是插件的完整配置 GUI，可直接维护提供商名称、协议、Base URL、自定义请求头、模型与别名、图片模型、输入/输出模态、思考参数，以及带代理和优先级的多个 API Key。配置和凭据操作均通过 CPA 认证后的 Management API 完成，不需要手工编辑 YAML 或凭据文件。
 
 后续更新和卸载也从 CPA 插件商店执行；自定义库会读取本仓库的最新正式 Release，不需要每次修改库地址。如果 CPA 提示需要重启，请完成重启后再继续使用；Windows 上更新已加载的动态库时通常必须重启。
