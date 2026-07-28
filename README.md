@@ -18,6 +18,8 @@
 - 从源码构建时使用 Go 1.26.5 或更高的 1.26.x 安全补丁版本
 - 预编译 Linux 包面向 GNU/Linux，最低 glibc 2.31
 
+Linux ARM64 必须使用 CPA 的普通 `linux_aarch64` 发布包；名称带 `_no-plugin` 的包是 CGO=0 便携版，官方明确不支持动态插件。OpenWrt/musl 环境也不能直接使用这个预编译插件，需要在兼容的 glibc 环境运行 CPA，或同时为 CPA 和插件准备带 CGO 的同环境构建。
+
 ## 安装
 
 ### 自定义插件库（推荐）
@@ -68,6 +70,17 @@ plugins:
 “通用提供商”是插件的完整配置 GUI，可直接维护提供商名称、协议、Base URL、自定义请求头、模型与别名、图片模型、输入/输出模态、思考参数，以及带代理和优先级的多个 API Key。配置和凭据操作均通过 CPA 认证后的 Management API 完成，不需要手工编辑 YAML 或凭据文件。
 
 后续更新和卸载也从 CPA 插件商店执行；自定义库会读取本仓库的最新正式 Release，不需要每次修改库地址。如果 CPA 提示需要重启，请完成重启后再继续使用；Windows 上更新已加载的动态库时通常必须重启。
+
+### 安装后显示“未注册”
+
+“已安装”只代表 ZIP 已下载并写入插件目录；“已注册”还要求 CPA 宿主成功加载动态库。请依次检查：
+
+1. `CLIProxyAPI --version` 至少为 v7.2.103。
+2. Linux ARM64 使用的是 `CLIProxyAPI_<version>_linux_aarch64.tar.gz`，不是 `_no-plugin.tar.gz`。
+3. CPA 的管理接口响应头 `X-CPA-SUPPORT-PLUGIN` 为 `1`；为 `0` 表示当前 CPA 是 CGO=0 构建，无法加载标准动态插件。
+4. 重启 CPA 后查看日志中的 `pluginhost` 行。如果出现 `GLIBC_* not found`、`wrong ELF class` 或 `cannot open shared object`，说明 libc 或架构不匹配。
+
+插件注册成功后，管理中心需要重新打开或刷新页面，“通用提供商”面板才会出现。
 
 ### 手动安装（备选）
 
