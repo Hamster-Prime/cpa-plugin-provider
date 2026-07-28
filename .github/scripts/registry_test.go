@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -21,16 +22,30 @@ type customRegistry struct {
 }
 
 type customRegistryPlugin struct {
-	ID          string   `json:"id"`
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	Author      string   `json:"author"`
-	Version     string   `json:"version"`
-	Repository  string   `json:"repository"`
-	Logo        string   `json:"logo"`
-	Homepage    string   `json:"homepage"`
-	License     string   `json:"license"`
-	Tags        []string `json:"tags"`
+	ID          string                `json:"id"`
+	Name        string                `json:"name"`
+	Description string                `json:"description"`
+	Author      string                `json:"author"`
+	Version     string                `json:"version"`
+	Repository  string                `json:"repository"`
+	Logo        string                `json:"logo"`
+	Homepage    string                `json:"homepage"`
+	License     string                `json:"license"`
+	Tags        []string              `json:"tags"`
+	Install     customRegistryInstall `json:"install"`
+}
+
+type customRegistryInstall struct {
+	Type      string                   `json:"type"`
+	Artifacts []customRegistryArtifact `json:"artifacts"`
+}
+
+type customRegistryArtifact struct {
+	GOOS   string `json:"goos"`
+	GOARCH string `json:"goarch"`
+	URL    string `json:"url"`
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
 }
 
 func TestCustomRegistryMatchesPublishedPlugin(t *testing.T) {
@@ -49,8 +64,8 @@ func TestCustomRegistryMatchesPublishedPlugin(t *testing.T) {
 	if err = expectJSONEOF(decoder); err != nil {
 		t.Fatalf("registry trailing data: %v", err)
 	}
-	if registry.SchemaVersion != 1 {
-		t.Fatalf("schema_version = %d, want 1", registry.SchemaVersion)
+	if registry.SchemaVersion != 2 {
+		t.Fatalf("schema_version = %d, want 2", registry.SchemaVersion)
 	}
 	if len(registry.Plugins) != 1 {
 		t.Fatalf("plugins length = %d, want 1", len(registry.Plugins))
@@ -74,6 +89,51 @@ func TestCustomRegistryMatchesPublishedPlugin(t *testing.T) {
 	}
 	if plugin.License != "MIT" || len(plugin.Tags) == 0 {
 		t.Fatalf("registry license/tags = %q/%#v", plugin.License, plugin.Tags)
+	}
+	if plugin.Install.Type != "direct" {
+		t.Fatalf("registry install.type = %q, want direct", plugin.Install.Type)
+	}
+	wantArtifacts := map[string]customRegistryArtifact{
+		"linux/amd64": {
+			SHA256: "86902254b52155940170a4eb9331d42940ed8d2f7cd6079fb1025317670cc382",
+			Size:   5022511,
+		},
+		"linux/arm64": {
+			SHA256: "0eef533ba80951778cbac0c86f1a7914522848f8e6620847c0c55ad79b134598",
+			Size:   4559471,
+		},
+		"darwin/amd64": {
+			SHA256: "e4393340b25c274a4cb065c632f5f0e5ba89f4622cf2738a2136cb0771fb5176",
+			Size:   4803965,
+		},
+		"darwin/arm64": {
+			SHA256: "acaed869da5d6ad4be70f87dbcfde84f2303a9e80e93caf300b97031352ade8c",
+			Size:   4436796,
+		},
+		"windows/amd64": {
+			SHA256: "f7acd16ebd1e5cb96196f6077ea68f152917d2e5f28406654857a6d8bde54d1c",
+			Size:   4899801,
+		},
+	}
+	if len(plugin.Install.Artifacts) != len(wantArtifacts) {
+		t.Fatalf("registry artifact count = %d, want %d", len(plugin.Install.Artifacts), len(wantArtifacts))
+	}
+	for _, artifact := range plugin.Install.Artifacts {
+		key := artifact.GOOS + "/" + artifact.GOARCH
+		want, ok := wantArtifacts[key]
+		if !ok {
+			t.Fatalf("unexpected registry artifact platform %q", key)
+		}
+		if artifact.SHA256 != want.SHA256 || artifact.Size != want.Size {
+			t.Fatalf("artifact %s hash/size = %q/%d, want %q/%d", key, artifact.SHA256, artifact.Size, want.SHA256, want.Size)
+		}
+		parsed, errParse := url.Parse(artifact.URL)
+		if errParse != nil || parsed.Scheme != "https" || parsed.RawQuery != "" || parsed.Fragment != "" {
+			t.Fatalf("artifact %s URL is not a pinned HTTPS URL: %q", key, artifact.URL)
+		}
+		if !strings.Contains(parsed.Path, "/releases/download/v"+provider.Version+"/") {
+			t.Fatalf("artifact %s URL does not point to v%s release: %q", key, provider.Version, artifact.URL)
+		}
 	}
 
 	readme, err := os.ReadFile(filepath.Join(root, "README.md"))

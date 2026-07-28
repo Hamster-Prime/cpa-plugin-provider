@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "plugins": [
     {
       "id": "multi-protocol-provider",
@@ -17,7 +17,47 @@
         "OpenAI",
         "Anthropic",
         "Gemini"
-      ]
+      ],
+      "install": {
+        "type": "direct",
+        "artifacts": [
+          {
+            "goos": "linux",
+            "goarch": "amd64",
+            "url": "https://github.com/Hamster-Prime/cpa-plugin-provider/releases/download/v0.2.0/multi-protocol-provider_0.2.0_linux_amd64.zip",
+            "sha256": "86902254b52155940170a4eb9331d42940ed8d2f7cd6079fb1025317670cc382",
+            "size": 5022511
+          },
+          {
+            "goos": "linux",
+            "goarch": "arm64",
+            "url": "https://github.com/Hamster-Prime/cpa-plugin-provider/releases/download/v0.2.0/multi-protocol-provider_0.2.0_linux_arm64.zip",
+            "sha256": "0eef533ba80951778cbac0c86f1a7914522848f8e6620847c0c55ad79b134598",
+            "size": 4559471
+          },
+          {
+            "goos": "darwin",
+            "goarch": "amd64",
+            "url": "https://github.com/Hamster-Prime/cpa-plugin-provider/releases/download/v0.2.0/multi-protocol-provider_0.2.0_darwin_amd64.zip",
+            "sha256": "e4393340b25c274a4cb065c632f5f0e5ba89f4622cf2738a2136cb0771fb5176",
+            "size": 4803965
+          },
+          {
+            "goos": "darwin",
+            "goarch": "arm64",
+            "url": "https://github.com/Hamster-Prime/cpa-plugin-provider/releases/download/v0.2.0/multi-protocol-provider_0.2.0_darwin_arm64.zip",
+            "sha256": "acaed869da5d6ad4be70f87dbcfde84f2303a9e80e93caf300b97031352ade8c",
+            "size": 4436796
+          },
+          {
+            "goos": "windows",
+            "goarch": "amd64",
+            "url": "https://github.com/Hamster-Prime/cpa-plugin-provider/releases/download/v0.2.0/multi-protocol-provider_0.2.0_windows_amd64.zip",
+            "sha256": "f7acd16ebd1e5cb96196f6077ea68f152917d2e5f28406654857a6d8bde54d1c",
+            "size": 4899801
+          }
+        ]
+      }
     }
   ]
 }

@@ -40,15 +40,17 @@ plugins:
 
 如果配置文件中已经存在 `plugins:`，只需把 `store-sources` 合并到现有节点，不要创建第二个 `plugins:`。自定义库会与 CPA 内置官方库同时显示，不会覆盖官方库。
 
-CPA 需要能够访问 `raw.githubusercontent.com`、`api.github.com` 和 GitHub Release 下载地址；网络受限时请先配置 CPA 的全局 `proxy-url`。全局 `plugins.enabled` 不会因安装动作自动开启，因此应保留上例中的 `enabled: true`。
+CPA 需要能够访问 `raw.githubusercontent.com` 和 GitHub Release 下载地址（通常会跳转到 `release-assets.githubusercontent.com`）；网络受限时请先配置 CPA 的全局 `proxy-url`。这个自定义库使用 CPA 的 schema v2 直链安装格式，registry 已固定每个平台 ZIP 的 SHA-256 和大小，因此安装时不会查询 GitHub Release API，也不会触发匿名 API rate limit。全局 `plugins.enabled` 不会因安装动作自动开启，因此应保留上例中的 `enabled: true`。
 
 1. 保存配置并重启 CPA，或使用现有的配置重载方式使其生效。
 2. 打开 CPA 管理中心的“插件商店”并刷新列表。
-3. 搜索 **Multi-Protocol Provider**，确认来源为上述自定义库，然后点击安装。CPA 会选择当前操作系统和架构对应的 Release ZIP，并使用发布页中的 `checksums.txt` 校验文件。
+3. 搜索 **Multi-Protocol Provider**，确认来源为上述自定义库，然后点击安装。CPA 会选择当前操作系统和架构对应的 Release ZIP，并使用 registry 中固定的 SHA-256 校验文件。
 4. 如果 CPA 的全局插件开关尚未开启，按管理中心提示启用插件功能。
 5. 安装完成后，在“插件”菜单打开“通用提供商”。
 6. 首次打开时输入 CPA 的 Management Key（`remote-management.secret-key`）。该 Key 只保存在当前页面内存中，不写入浏览器存储。
 7. 选择上游协议，填写 Base URL、模型和 API Key，然后保存并使用“测试连接”验证。
+
+如果旧版 registry 已经返回过 GitHub API `403 rate limit exceeded`，请在本次 registry 更新后重启 CPA（或等待失败缓存过期）并刷新插件商店，然后重新安装；无需配置 GitHub Token。
 
 “通用提供商”是插件的完整配置 GUI，可直接维护提供商名称、协议、Base URL、自定义请求头、模型与别名、图片模型、输入/输出模态、思考参数，以及带代理和优先级的多个 API Key。配置和凭据操作均通过 CPA 认证后的 Management API 完成，不需要手工编辑 YAML 或凭据文件。
 
