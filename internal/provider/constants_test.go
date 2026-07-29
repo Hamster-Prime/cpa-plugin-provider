@@ -10,7 +10,7 @@ func TestPublishedMetadata(t *testing.T) {
 	if ID != "multi-protocol-provider" {
 		t.Fatalf("ID = %q", ID)
 	}
-	if Version != "0.2.0" {
+	if Version != "0.3.0" {
 		t.Fatalf("Version = %q", Version)
 	}
 	if DisplayName != "Multi-Protocol Provider" || Author != "Hamster-Prime" || Repository != "https://github.com/Hamster-Prime/cpa-plugin-provider" {

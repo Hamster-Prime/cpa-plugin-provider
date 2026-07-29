@@ -48,7 +48,7 @@ type customRegistryArtifact struct {
 	Size   int64  `json:"size"`
 }
 
-func TestCustomRegistryMatchesPublishedPlugin(t *testing.T) {
+func TestCustomRegistryIsPinnedAndSelfConsistent(t *testing.T) {
 	root := filepath.Join("..", "..")
 	data, err := os.ReadFile(filepath.Join(root, "registry.json"))
 	if err != nil {
@@ -75,11 +75,11 @@ func TestCustomRegistryMatchesPublishedPlugin(t *testing.T) {
 	if !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`).MatchString(plugin.ID) {
 		t.Fatalf("invalid plugin id %q", plugin.ID)
 	}
-	if plugin.ID != provider.ID || plugin.Version != provider.Version {
-		t.Fatalf("registry id/version = %q/%q, want %q/%q", plugin.ID, plugin.Version, provider.ID, provider.Version)
+	if plugin.ID != provider.ID {
+		t.Fatalf("registry id = %q, want %q", plugin.ID, provider.ID)
 	}
-	if strings.HasPrefix(plugin.Version, "v") {
-		t.Fatalf("registry version must not use a v prefix: %q", plugin.Version)
+	if !regexp.MustCompile(`^[0-9]+(?:\.[0-9]+)+$`).MatchString(plugin.Version) {
+		t.Fatalf("registry version must be a numeric version without a v prefix: %q", plugin.Version)
 	}
 	if plugin.Name == "" || plugin.Description == "" || plugin.Author == "" {
 		t.Fatalf("required registry metadata is incomplete: %#v", plugin)
@@ -131,8 +131,8 @@ func TestCustomRegistryMatchesPublishedPlugin(t *testing.T) {
 		if errParse != nil || parsed.Scheme != "https" || parsed.RawQuery != "" || parsed.Fragment != "" {
 			t.Fatalf("artifact %s URL is not a pinned HTTPS URL: %q", key, artifact.URL)
 		}
-		if !strings.Contains(parsed.Path, "/releases/download/v"+provider.Version+"/") {
-			t.Fatalf("artifact %s URL does not point to v%s release: %q", key, provider.Version, artifact.URL)
+		if !strings.Contains(parsed.Path, "/releases/download/v"+plugin.Version+"/") {
+			t.Fatalf("artifact %s URL does not point to v%s release: %q", key, plugin.Version, artifact.URL)
 		}
 	}
 

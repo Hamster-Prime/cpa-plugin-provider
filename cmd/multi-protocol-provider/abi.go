@@ -65,7 +65,7 @@ var abiState = struct {
 
 //export cliproxy_plugin_init
 func cliproxy_plugin_init(host *C.cliproxy_host_api, api *C.cliproxy_plugin_api) C.int {
-	if host == nil || api == nil || host.call == nil || host.free_buffer == nil {
+	if host == nil || api == nil {
 		return 1
 	}
 	abiState.Lock()

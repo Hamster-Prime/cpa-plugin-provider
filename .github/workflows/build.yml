@@ -24,6 +24,16 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Verify release tag matches source version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          source_version="$(go run ./.github/scripts/plugin-version)"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [[ "${tag_version}" != "${source_version}" ]]; then
+            echo "release tag ${GITHUB_REF_NAME} does not match source version ${source_version}" >&2
+            exit 1
+          fi
       - run: go test -race ./... ./.github/scripts ./.github/scripts/stock-e2e
       - run: go vet ./... ./.github/scripts ./.github/scripts/stock-e2e
       - name: Vulnerability scan
@@ -111,6 +121,13 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        if: matrix.goarch == 'arm64'
+        with:
+          repository: router-for-me/CLIProxyAPI
+          ref: cade44b9cdee6b9328ea2648fd119129fdf11e2d # v7.2.103
+          path: CLIProxyAPI
+          fetch-depth: 1
       - name: Resolve names
         run: |
           set -euo pipefail
@@ -163,6 +180,14 @@ jobs:
             echo "highest GLIBC symbol version is ${highest}, expected <= 2.31" >&2
             exit 1
           fi
+      - name: Test ARM64 release library with stock CPA
+        if: matrix.goarch == 'arm64'
+        run: |
+          set -euo pipefail
+          go -C CLIProxyAPI build -o "${RUNNER_TEMP}/cli-proxy-api-arm64" ./cmd/server
+          go run ./.github/scripts/stock-e2e \
+            -host "${RUNNER_TEMP}/cli-proxy-api-arm64" \
+            -plugin "dist/${LIBRARY}"
       - name: Package
         run: |
           set -euo pipefail

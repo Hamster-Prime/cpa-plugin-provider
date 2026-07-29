@@ -272,6 +272,9 @@
     const PLUGIN_ID = 'multi-protocol-provider';
     const MANAGEMENT = '/v0/management';
     const API = `${MANAGEMENT}/plugins/${PLUGIN_ID}`;
+    const AUTH_MESSAGE = 'cpa-management-auth';
+    const READY_MESSAGE = 'cpa-multi-protocol-provider-ready';
+    const parentOrigin = new URLSearchParams(window.location.search).get('parent-origin') || '';
     const state = {
       config: null,
       credentialDestination: null,
@@ -283,6 +286,8 @@
       busy: false
     };
     let managementToken = '';
+    let authFallbackTimer = 0;
+    let authReadyTimer = 0;
     const $ = (selector, root = document) => root.querySelector(selector);
     const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
     const app = $('#app');
@@ -292,8 +297,34 @@
 
     function getToken() { return managementToken; }
     function setToken(value) { managementToken = String(value || ''); }
-    function showAuth() { authModal.hidden = false; managementKey.value = ''; setTimeout(() => managementKey.focus(), 0); }
+    function clearAuthTimers() {
+      clearTimeout(authFallbackTimer);
+      clearInterval(authReadyTimer);
+      authFallbackTimer = 0;
+      authReadyTimer = 0;
+    }
+    function showAuth() {
+      clearAuthTimers();
+      authModal.hidden = false;
+      managementKey.value = '';
+      setTimeout(() => managementKey.focus(), 0);
+    }
     function hideAuth() { authModal.hidden = true; }
+    function requestParentAuth() {
+      if (!parentOrigin || window.parent === window) return false;
+      try {
+        const announceReady = () => window.parent.postMessage({ type: READY_MESSAGE }, parentOrigin);
+        announceReady();
+        authReadyTimer = setInterval(announceReady, 250);
+        authFallbackTimer = setTimeout(() => {
+          clearAuthTimers();
+          if (!getToken()) showAuth();
+        }, 1500);
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
     function notify(message, kind = '') {
       const el = $('#notice');
       clearTimeout(state.noticeTimer);
@@ -854,6 +885,17 @@
     $('#test-model').addEventListener('input', updateCountsAndTestOptions);
     $('#prefix').addEventListener('input', updateCountsAndTestOptions);
     $('#auth-form').addEventListener('submit', (event) => { event.preventDefault(); const value = managementKey.value.trim(); if (!value) return; setToken(value); managementKey.value = ''; load(); });
+    window.addEventListener('message', (event) => {
+      if (!parentOrigin || event.source !== window.parent || event.origin !== parentOrigin) return;
+      const payload = event.data;
+      if (!payload || payload.type !== AUTH_MESSAGE || typeof payload.managementKey !== 'string') return;
+      const token = payload.managementKey.trim();
+      if (!token) return;
+      clearAuthTimers();
+      setToken(token);
+      hideAuth();
+      void load();
+    });
     const handleDraftMutation = (event) => { if (!event.target.closest?.('#model-discovery')) updateDirty(); };
     form.addEventListener('input', handleDraftMutation);
     form.addEventListener('change', handleDraftMutation);
@@ -864,7 +906,7 @@
       event.returnValue = '';
     });
     setBusy(false);
-    showAuth();
+    if (!requestParentAuth()) showAuth();
   })();
   </script>
 </body>

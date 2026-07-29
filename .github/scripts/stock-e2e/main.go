@@ -562,6 +562,8 @@ func validGUIResource(body []byte) bool {
 	return len(body) >= 1024 &&
 		bytes.Contains(lower, []byte("<!doctype html")) &&
 		bytes.Contains(lower, []byte("management-key")) &&
+		bytes.Contains(lower, []byte("cpa-management-auth")) &&
+		bytes.Contains(lower, []byte("cpa-multi-protocol-provider-ready")) &&
 		bytes.Contains(lower, []byte("provider-form"))
 }
 

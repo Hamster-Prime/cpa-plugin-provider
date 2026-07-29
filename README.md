@@ -9,7 +9,7 @@
 
 插件支持自定义名称和 URL、模型别名、多个 API Key、每个 Key 的代理与优先级、图片模型端点、输入/输出模态以及思考参数。请求仍可从 CPA 已支持的任意客户端协议进入；CPA 在调用插件前转换请求，插件再通过 CPA 官方翻译层按客户端目标协议返回响应。
 
-> CPA 的插件接口不能让第三方插件动态加入管理中心内置的“AI 提供商”列表。此插件会在“插件”菜单注册一个专用的“通用提供商”页面，提供完整的图形化配置体验；运行时模型和 Key 则接入 CPA 原生注册、调度、冷却与失败重试流程。
+> CPA 的插件接口本身不能让第三方插件动态加入管理中心内置的“AI 提供商”列表。本项目同时提供[配套的管理中心分支](https://github.com/Hamster-Prime/Cli-Proxy-API-Management-Center)，它会把此插件显示为“AI 提供商”中的独立“通用协议”分类；使用官方管理中心时，完整 GUI 仍可从单独的插件页面打开。运行时模型和 Key 均接入 CPA 原生注册、调度、冷却与失败重试流程。
 
 ## 要求
 
@@ -22,7 +22,7 @@ Linux ARM64 必须使用 CPA 的普通 `linux_aarch64` 发布包；名称带 `_n
 
 ## 安装
 
-### 自定义插件库（推荐）
+### 自定义管理面板 + 自定义插件库（推荐）
 
 本项目提供符合 CPA 插件商店规范的自定义库：
 
@@ -30,9 +30,12 @@ Linux ARM64 必须使用 CPA 的普通 `linux_aarch64` 发布包；名称带 `_n
 https://raw.githubusercontent.com/Hamster-Prime/cpa-plugin-provider/main/registry.json
 ```
 
-在 CPA 的 `config.yaml` 中，把该地址加入 `plugins.store-sources`：
+在 CPA 的 `config.yaml` 中同时选择配套管理面板仓库，并把插件库地址加入 `plugins.store-sources`：
 
 ```yaml
+remote-management:
+  panel-github-repository: "https://github.com/Hamster-Prime/Cli-Proxy-API-Management-Center"
+
 plugins:
   enabled: true
   dir: plugins
@@ -40,17 +43,19 @@ plugins:
     - "https://raw.githubusercontent.com/Hamster-Prime/cpa-plugin-provider/main/registry.json"
 ```
 
-如果配置文件中已经存在 `plugins:`，只需把 `store-sources` 合并到现有节点，不要创建第二个 `plugins:`。自定义库会与 CPA 内置官方库同时显示，不会覆盖官方库。
+如果配置文件中已经存在 `remote-management:` 或 `plugins:`，请把字段合并到现有节点，不要创建第二个同名节点。自定义库会与 CPA 内置官方库同时显示，不会覆盖官方库。配套管理面板只改变 Web UI，不替换 CPA 主程序。
 
 CPA 需要能够访问 `raw.githubusercontent.com` 和 GitHub Release 下载地址（通常会跳转到 `release-assets.githubusercontent.com`）；网络受限时请先配置 CPA 的全局 `proxy-url`。这个自定义库使用 CPA 的 schema v2 直链安装格式，registry 已固定每个平台 ZIP 的 SHA-256 和大小，因此安装时不会查询 GitHub Release API，也不会触发匿名 API rate limit。全局 `plugins.enabled` 不会因安装动作自动开启，因此应保留上例中的 `enabled: true`。
 
-1. 保存配置并重启 CPA，或使用现有的配置重载方式使其生效。
+1. 保存配置并重启 CPA，使插件宿主和管理面板仓库配置同时生效。
 2. 打开 CPA 管理中心的“插件商店”并刷新列表。
 3. 搜索 **Multi-Protocol Provider**，确认来源为上述自定义库，然后点击安装。CPA 会选择当前操作系统和架构对应的 Release ZIP，并使用 registry 中固定的 SHA-256 校验文件。
-4. 如果 CPA 的全局插件开关尚未开启，按管理中心提示启用插件功能。
-5. 安装完成后，在“插件”菜单打开“通用提供商”。
-6. 首次打开时输入 CPA 的 Management Key（`remote-management.secret-key`）。该 Key 只保存在当前页面内存中，不写入浏览器存储。
+4. 安装后重启 CPA，再刷新管理中心。
+5. 打开“AI 提供商”，选择新增的“通用协议”分类。
+6. 配套面板会把当前已登录的 Management Key 通过严格来源校验传给插件 iframe；使用官方面板的独立插件页面时，才需要在页面内再次输入 Management Key。插件页面不会把该 Key 写入浏览器存储。
 7. 选择上游协议，填写 Base URL、模型和 API Key，然后保存并使用“测试连接”验证。
+
+CPA 下载管理面板时会访问 GitHub Releases API。若日志中出现 API rate limit `403`，普通安装请从[配套面板 Releases](https://github.com/Hamster-Prime/Cli-Proxy-API-Management-Center/releases)下载 `management.html`，放入 CPA 配置文件同级的 `static/management.html`，然后重启 CPA。`GITSTORE_*` 环境变量会同时启用或改变 CPA 的 Git 凭据存储后端，不要仅为了面板下载而设置；只有原本就在使用正确 GitHub GitStore 仓库的部署，才应复用其现有 Token。
 
 如果旧版 registry 已经返回过 GitHub API `403 rate limit exceeded`，请在本次 registry 更新后重启 CPA（或等待失败缓存过期）并刷新插件商店，然后重新安装；无需配置 GitHub Token。
 
@@ -80,7 +85,7 @@ plugins:
 3. CPA 的管理接口响应头 `X-CPA-SUPPORT-PLUGIN` 为 `1`；为 `0` 表示当前 CPA 是 CGO=0 构建，无法加载标准动态插件。
 4. 重启 CPA 后查看日志中的 `pluginhost` 行。如果出现 `GLIBC_* not found`、`wrong ELF class` 或 `cannot open shared object`，说明 libc 或架构不匹配。
 
-插件注册成功后，管理中心需要重新打开或刷新页面，“通用提供商”面板才会出现。
+插件注册成功后，管理中心需要重新打开或刷新页面。配套管理面板会在“AI 提供商”中显示“通用协议”；官方管理面板只会显示独立插件页面。
 
 ### 手动安装（备选）
 
@@ -88,7 +93,7 @@ plugins:
 
 Linux 预编译包在 Debian Bullseye 环境使用 Go 1.26.5 生成，并在 CI 中检查最高 GLIBC 符号版本不超过 2.31。Alpine 等 musl 系统不能直接使用该包，需要在目标系统安装 Go、C 编译器和开发头文件后执行 `make build`，再安装使用相同 libc 和架构构建的动态库。
 
-手动安装时可以先使用以下最小配置启用插件；启动 CPA 后，其余设置均可在“插件”菜单的“通用提供商”页面完成。
+手动安装时可以先使用以下最小配置启用插件；启动 CPA 后，其余设置可在配套管理面板的“AI 提供商 > 通用协议”中完成，使用官方管理面板时则从独立插件页面完成。
 
 ```yaml
 plugins:
@@ -130,7 +135,7 @@ plugins:
           image: true
 ```
 
-启动或重启 CPA 后，在“插件”菜单打开“通用提供商”。管理页保存时会先停用提供商并等待 CPA 完成重载，再写入 Key，最后以完整配置替换旧设置；在最终配置应用前失败时，提供商会保持停用，避免新 Key 被发送到旧 Base URL。页面会按 CPA 当前实际状态报告最终是否启用。修改协议或 Base URL 时，所有 API Key 以及带认证信息的代理 URL 都必须重新输入，管理接口也会在后端强制检查这一点。
+启动或重启 CPA 后，在配套管理面板的“AI 提供商”中打开“通用协议”；使用官方管理面板时从独立插件页面打开“通用提供商”。管理页保存时会先停用提供商并等待 CPA 完成重载，再写入 Key，最后以完整配置替换旧设置；在最终配置应用前失败时，提供商会保持停用，避免新 Key 被发送到旧 Base URL。页面会按 CPA 当前实际状态报告最终是否启用。修改协议或 Base URL 时，所有 API Key 以及带认证信息的代理 URL 都必须重新输入，管理接口也会在后端强制检查这一点。
 
 ## 从源码构建
 

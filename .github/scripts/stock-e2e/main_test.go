@@ -34,7 +34,8 @@ func TestStockConfigYAMLContainsIsolatedPluginConfiguration(t *testing.T) {
 }
 
 func TestValidGUIResourceRequiresConfigurationShell(t *testing.T) {
-	valid := []byte("<!doctype html><form id=\"provider-form\"><input id=\"management-key\"></form>" + strings.Repeat("x", 1024))
+	valid := []byte("<!doctype html><form id=\"provider-form\"><input id=\"management-key\"></form>" +
+		"cpa-management-auth cpa-multi-protocol-provider-ready" + strings.Repeat("x", 1024))
 	if !validGUIResource(valid) {
 		t.Fatal("complete GUI resource was rejected")
 	}
