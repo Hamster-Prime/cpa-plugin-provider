@@ -95,24 +95,24 @@ func TestCustomRegistryIsPinnedAndSelfConsistent(t *testing.T) {
 	}
 	wantArtifacts := map[string]customRegistryArtifact{
 		"linux/amd64": {
-			SHA256: "86902254b52155940170a4eb9331d42940ed8d2f7cd6079fb1025317670cc382",
-			Size:   5022511,
+			SHA256: "07cc59829a279e6766f0f9be853688593456f0c8a4ec2a6468d2b5615b099c09",
+			Size:   5024708,
 		},
 		"linux/arm64": {
-			SHA256: "0eef533ba80951778cbac0c86f1a7914522848f8e6620847c0c55ad79b134598",
-			Size:   4559471,
+			SHA256: "fc048a4c83c04d8982318b66d6b6aef724568d68eed1511dc48bb360c0accd77",
+			Size:   4561697,
 		},
 		"darwin/amd64": {
-			SHA256: "e4393340b25c274a4cb065c632f5f0e5ba89f4622cf2738a2136cb0771fb5176",
-			Size:   4803965,
+			SHA256: "a98a3145f1005290c8b659da8f25338a2a61a3907a2dff77c3668101f143fff4",
+			Size:   4806151,
 		},
 		"darwin/arm64": {
-			SHA256: "acaed869da5d6ad4be70f87dbcfde84f2303a9e80e93caf300b97031352ade8c",
-			Size:   4436796,
+			SHA256: "b44bedec07e9f56d92a1b9af6151dcb99ab611a9feda77c4b2c6ebf3293207a9",
+			Size:   4439019,
 		},
 		"windows/amd64": {
-			SHA256: "f7acd16ebd1e5cb96196f6077ea68f152917d2e5f28406654857a6d8bde54d1c",
-			Size:   4899801,
+			SHA256: "8361567753897f087ae76d6ddf690856927fc3bbea14fe33da1d371e36d14f05",
+			Size:   4902144,
 		},
 	}
 	if len(plugin.Install.Artifacts) != len(wantArtifacts) {

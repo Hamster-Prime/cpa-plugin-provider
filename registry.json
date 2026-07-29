@@ -6,7 +6,7 @@
       "name": "Multi-Protocol Provider",
       "description": "Adds a configurable upstream provider with OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and Gemini protocols, multi-key routing, model aliases, image endpoints, thinking parameters, proxies, and an embedded management GUI.",
       "author": "Hamster-Prime",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "repository": "https://github.com/Hamster-Prime/cpa-plugin-provider",
       "logo": "https://avatars.githubusercontent.com/u/60058434?s=64&v=4",
       "homepage": "https://github.com/Hamster-Prime/cpa-plugin-provider",
@@ -24,37 +24,37 @@
           {
             "goos": "linux",
             "goarch": "amd64",
-            "url": "https://github.com/Hamster-Prime/cpa-plugin-provider/releases/download/v0.2.0/multi-protocol-provider_0.2.0_linux_amd64.zip",
-            "sha256": "86902254b52155940170a4eb9331d42940ed8d2f7cd6079fb1025317670cc382",
-            "size": 5022511
+            "url": "https://github.com/Hamster-Prime/cpa-plugin-provider/releases/download/v0.3.0/multi-protocol-provider_0.3.0_linux_amd64.zip",
+            "sha256": "07cc59829a279e6766f0f9be853688593456f0c8a4ec2a6468d2b5615b099c09",
+            "size": 5024708
           },
           {
             "goos": "linux",
             "goarch": "arm64",
-            "url": "https://github.com/Hamster-Prime/cpa-plugin-provider/releases/download/v0.2.0/multi-protocol-provider_0.2.0_linux_arm64.zip",
-            "sha256": "0eef533ba80951778cbac0c86f1a7914522848f8e6620847c0c55ad79b134598",
-            "size": 4559471
+            "url": "https://github.com/Hamster-Prime/cpa-plugin-provider/releases/download/v0.3.0/multi-protocol-provider_0.3.0_linux_arm64.zip",
+            "sha256": "fc048a4c83c04d8982318b66d6b6aef724568d68eed1511dc48bb360c0accd77",
+            "size": 4561697
           },
           {
             "goos": "darwin",
             "goarch": "amd64",
-            "url": "https://github.com/Hamster-Prime/cpa-plugin-provider/releases/download/v0.2.0/multi-protocol-provider_0.2.0_darwin_amd64.zip",
-            "sha256": "e4393340b25c274a4cb065c632f5f0e5ba89f4622cf2738a2136cb0771fb5176",
-            "size": 4803965
+            "url": "https://github.com/Hamster-Prime/cpa-plugin-provider/releases/download/v0.3.0/multi-protocol-provider_0.3.0_darwin_amd64.zip",
+            "sha256": "a98a3145f1005290c8b659da8f25338a2a61a3907a2dff77c3668101f143fff4",
+            "size": 4806151
           },
           {
             "goos": "darwin",
             "goarch": "arm64",
-            "url": "https://github.com/Hamster-Prime/cpa-plugin-provider/releases/download/v0.2.0/multi-protocol-provider_0.2.0_darwin_arm64.zip",
-            "sha256": "acaed869da5d6ad4be70f87dbcfde84f2303a9e80e93caf300b97031352ade8c",
-            "size": 4436796
+            "url": "https://github.com/Hamster-Prime/cpa-plugin-provider/releases/download/v0.3.0/multi-protocol-provider_0.3.0_darwin_arm64.zip",
+            "sha256": "b44bedec07e9f56d92a1b9af6151dcb99ab611a9feda77c4b2c6ebf3293207a9",
+            "size": 4439019
           },
           {
             "goos": "windows",
             "goarch": "amd64",
-            "url": "https://github.com/Hamster-Prime/cpa-plugin-provider/releases/download/v0.2.0/multi-protocol-provider_0.2.0_windows_amd64.zip",
-            "sha256": "f7acd16ebd1e5cb96196f6077ea68f152917d2e5f28406654857a6d8bde54d1c",
-            "size": 4899801
+            "url": "https://github.com/Hamster-Prime/cpa-plugin-provider/releases/download/v0.3.0/multi-protocol-provider_0.3.0_windows_amd64.zip",
+            "sha256": "8361567753897f087ae76d6ddf690856927fc3bbea14fe33da1d371e36d14f05",
+            "size": 4902144
           }
         ]
       }
